@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from recommender import CALENDAR_END, Contractor, SearchRequest, recommend
+from recommender import CALENDAR_END, Contractor, SearchRequest, recommend, requested_languages, rejection_reasons
 
 
 CALENDAR_START = date(2026, 9, 23)
@@ -16,7 +16,7 @@ ENDPOINTS = {"openai": "https://api.openai.com/v1", "nvidia": "https://integrate
 MAX_ROUNDS = 4
 MAX_CALLS = 8
 MAX_HISTORY_CHARS = 120_000
-CHAT_VERSION = 3
+CHAT_VERSION = 4
 
 SYSTEM_PROMPT = """Ты ИИ-агент по подбору event-подрядчиков для HackAlem AI.
 Отвечай на языке пользователя. Помогай собрать условия мероприятия.
@@ -54,8 +54,15 @@ get_search_options даёт допустимые значения. search_contra
 Альтернативная дата или бюджет — предложение, а не изменение условий пользователя.
 Менять поиск на предложенный вариант можно только после явного выбора пользователя.
 Не показывай непроверенные варианты как найденные. При сбое честно сообщи об этом.
-Поиск возвращает ВСЕХ подходящих подрядчиков, не только трёх. Полный список карточек
-приложение покажет отдельно: в тексте кратко укажи число найденных и условия поиска.
+Для русского/казахского уточни: нужны оба языка или любой из них? Если нужны оба,
+передай language="русский/казахский". Не снимай язык ради результата самостоятельно.
+Поиск возвращает всех подходящих, интерфейс сначала показывает TOP-3, остальных можно раскрыть.
+Перед результатом кратко напиши, какие условия понял. Для TOP-3 объясни отличия
+на основании profile_quote и preference_evidence из функции. Не выдавай semantic similarity
+за доказательство пожелания. match_percent — доля подтверждённых условий, не вероятность качества.
+Если нет точного доказательства пожелания, так и скажи. Не выдумывай опыт или контакты.
+explain_contractor_match проверяет конкретного подрядчика по всем условиям и объясняет отказ.
+Заявки и связь в приложении — только демо-черновики без отправки. Не обещай отправку.
 """
 
 
@@ -126,6 +133,9 @@ TOOLS = [
     {"type": "function", "name": "get_contractor", "strict": True,
      "description": "Прочитать профиль по известному ID. Сам по себе не проверяет доступность на дату.",
      "parameters": _object({"contractor_id": {"type": "string"}})},
+    {"type": "function", "name": "explain_contractor_match", "strict": True,
+     "description": "Почему конкретный подрядчик не подходит: проверка ID и всех заданных условий.",
+     "parameters": _object({"contractor_id": {"type": "string"}, "request": SEARCH_PARAMETERS})},
 ]
 
 
@@ -133,10 +143,42 @@ def request_dict(request: SearchRequest) -> dict:
     return {**asdict(request), "event_date": request.event_date.isoformat()}
 
 
+def result_payload(request, result):
+    return {
+        "request": request_dict(request), "status": result.status, "message": result.message,
+        "matched_count": result.matched_count, "pipeline": list(result.pipeline),
+        "ranking_mode": result.ranking_mode, "ranking_notice": result.ranking_notice,
+        "recommendations": [
+            {"id": r.contractor.id, "name": r.contractor.name, "price_from_kzt": r.contractor.price,
+             "score": r.score, "match_percent": r.match_percent, "checks": r.checks,
+             "languages": r.contractor.languages, "max_hours": r.contractor.max_hours,
+             "profile_quote": r.profile_quote, "preference_evidence": r.preference_evidence,
+             "ranking_reason": r.ranking_reason, "factors": r.factors,
+             "explanation": r.explanation, "synthetic": r.contractor.synthetic}
+            for r in result.recommendations],
+        "rejection_counts": dict(result.rejection_counts),
+        "near_matches": [{"id": n.contractor.id, "name": n.contractor.name,
+                          "price_from_kzt": n.contractor.price, "languages": n.contractor.languages,
+                          "max_hours": n.contractor.max_hours, "reasons": n.reasons}
+                         for n in result.near_matches],
+        "suggestions": [{"request": request_dict(s.request), "count": s.count, "message": s.message,
+                         "kind": s.kind, "added_count": s.added_count} for s in result.suggestions],
+        "note": "Альтернативы не применены. Для смены условий нужен выбор пользователя.",
+    }
+
+
 class SearchTools:
-    def __init__(self, contractors: list[Contractor], today: date | None = None):
+    def __init__(self, contractors: list[Contractor], today: date | None = None, *, semantic_ranker=None,
+                 related_categories=None):
         self.contractors = contractors
         self.today = today or current_event_date()
+        self.semantic_ranker = semantic_ranker
+        self.related_categories = related_categories or {}
+
+    def search(self, request):
+        result = recommend(self.contractors, request, limit=None, semantic_ranker=self.semantic_ranker,
+                           related_categories=self.related_categories)
+        return result_payload(request, result)
 
     def options(self) -> dict:
         return {
@@ -158,6 +200,10 @@ class SearchTools:
                               ("event_format", "event_formats"), ("language", "languages")):
             if field == "language" and args[field] is None:
                 continue
+            if field == "language" and isinstance(args[field], str):
+                languages = requested_languages(SearchRequest("", self.today, "", "", language=args[field]))
+                if languages and all(v in options[values] for v in languages):
+                    continue
             if not isinstance(args[field], str) or args[field] not in options[values]:
                 raise ValueError(f"Недопустимое поле {field}; уточните значение через get_search_options.")
         if args["budget"] is not None and (type(args["budget"]) is not int or not 1 <= args["budget"] <= 1_000_000_000):
@@ -198,23 +244,25 @@ class SearchTools:
                         "max_hours": item.max_hours, "description": item.description,
                         "synthetic": item.synthetic,
                         "note": "Описание со слов подрядчика; доступность проверяйте через search_contractors."}
+            if name == "explain_contractor_match":
+                if set(args) != {"contractor_id", "request"} or not isinstance(args["request"], dict):
+                    raise ValueError("Передайте contractor_id и request.")
+                item = next((c for c in self.contractors if c.id == args["contractor_id"]), None)
+                if item is None:
+                    raise ValueError("Профиль с таким ID не найден.")
+                request = self.parse_request(args["request"])
+                reasons = list(rejection_reasons(item, request))
+                if item.city != request.city:
+                    reasons.append("не подходит город")
+                if request.category not in item.categories:
+                    reasons.append("не подходит категория")
+                return {"id": item.id, "name": item.name, "eligible": not reasons, "reasons": reasons,
+                        "price_from_kzt": item.price, "languages": item.languages, "max_hours": item.max_hours,
+                        "request": request_dict(request)}
             if name != "search_contractors":
                 raise ValueError("Неизвестная функция. Доступны только функции чтения каталога и поиска.")
             request = self.parse_request(args)
-            result = recommend(self.contractors, request, limit=None)
-            return {
-                "request": request_dict(request), "status": result.status, "message": result.message,
-                "matched_count": len(result.recommendations),
-                "recommendations": [
-                    {"id": r.contractor.id, "name": r.contractor.name, "price_from_kzt": r.contractor.price,
-                     "score": r.score, "explanation": r.explanation, "synthetic": r.contractor.synthetic}
-                    for r in result.recommendations
-                ],
-                "rejection_counts": dict(result.rejection_counts),
-                "suggestions": [{"request": request_dict(s.request), "count": s.count, "message": s.message}
-                                for s in result.suggestions],
-                "note": "Альтернативы не применены. Для смены условий нужен выбор пользователя.",
-            }
+            return self.search(request)
         except (ValueError, TypeError, OverflowError) as exc:
             # Validation messages contain no credentials or upstream API payloads.
             return {"error": str(exc)}
@@ -239,7 +287,7 @@ def _provider_error(exc: Exception) -> AssistantError:
 
 
 def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
-             history: list[dict] | None = None, *, client=None) -> AssistantTurn:
+             history: list[dict] | None = None, *, client=None, search_tools=None) -> AssistantTurn:
     """Commit a complete turn only on success; never mutate caller-owned history."""
     if not text.strip() or len(text) > 4000:
         raise AssistantError("Введите сообщение длиной от 1 до 4000 символов.")
@@ -248,7 +296,7 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
     messages = [*(history or []), {"role": "user", "content": text}]
     if len(json.dumps(messages, ensure_ascii=False)) > MAX_HISTORY_CHARS:
         raise AssistantError("Диалог стал слишком длинным. Начните новый диалог и повторите условия.")
-    service = SearchTools(contractors)
+    service = search_tools or SearchTools(contractors)
     instructions = agent_instructions(service.today)
     owned_client = client is None
     client = client or create_client(config)

@@ -9,6 +9,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from preferences import evidence, fragments, terms
+
 
 def _split(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split("|") if item.strip())
@@ -47,6 +49,11 @@ class Recommendation:
     score: float
     explanation: str
     factors: tuple[tuple[str, float], ...]
+    match_percent: int = 100
+    checks: tuple[str, ...] = ()
+    preference_evidence: str = ""
+    profile_quote: str = ""
+    ranking_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,14 @@ class Suggestion:
     request: SearchRequest
     count: int
     message: str
+    kind: str = "date"
+    added_count: int = 0
+
+
+@dataclass(frozen=True)
+class NearMatch:
+    contractor: Contractor
+    reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -63,26 +78,22 @@ class SearchResult:
     recommendations: tuple[Recommendation, ...] = ()
     rejection_counts: tuple[tuple[str, int], ...] = ()
     suggestions: tuple[Suggestion, ...] = ()
+    pipeline: tuple[tuple[str, int], ...] = ()
+    near_matches: tuple[NearMatch, ...] = ()
+    matched_count: int = 0
+    ranking_mode: str = "local"
+    ranking_notice: str = ""
 
 
 CALENDAR_END = date(2026, 12, 31)
 
 
 def _fragments(description: str) -> list[str]:
-    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|[\n•]+", description) if part.strip()]
+    return fragments(description)
 
 
 def _preference_evidence(preferences: str, description: str) -> str:
-    # Conservative lexical evidence: every meaningful word must occur in one
-    # source fragment. Partial overlap is not confirmation of the whole wish.
-    stopwords = {"для", "на", "и", "с", "в", "по", "хочу", "нужен", "нужна", "чтобы"}
-    words = set(re.findall(r"[а-яёa-z0-9]+", preferences.casefold())) - stopwords
-    if not words:
-        return ""
-    for fragment in _fragments(description):
-        if words <= set(re.findall(r"[а-яёa-z0-9]+", fragment.casefold())):
-            return fragment
-    return ""
+    return evidence(preferences, description)
 
 
 def load_contractors(path: str | Path) -> list[Contractor]:
@@ -108,10 +119,7 @@ def load_contractors(path: str | Path) -> list[Contractor]:
 
 
 def _word_ngrams(value: str) -> list[str]:
-    words = re.findall(r"[а-яёa-z0-9]+", value.casefold())
-    terms = [word for word in words if len(word) > 2]
-    terms.extend(f"{left}_{right}" for left, right in zip(words, words[1:]))
-    return terms
+    return sorted(terms(value))
 
 
 def _text_relevance(query: str, documents: list[str]) -> list[float]:
@@ -145,40 +153,53 @@ def _text_relevance(query: str, documents: list[str]) -> list[float]:
     return scores
 
 
-def _score_factors(
-    contractor: Contractor, request: SearchRequest, relevance: float
-) -> tuple[tuple[str, float], ...]:
-    # Unspecified budget is no price filter and no price-based scoring bonus.
-    budget_cushion = max(0.0, 1.0 - contractor.price / request.budget) if request.budget is not None else 0.0
-    budget_score = 10 + 10 * budget_cushion
+def requested_languages(request: SearchRequest) -> tuple[str, ...]:
+    # Slash, comma and «и» mean ALL selected languages, never silently OR.
+    return tuple(p.strip() for p in re.split(r"[/,|]|\s+и\s+", request.language or "") if p.strip())
 
-    if request.duration_hours is None:
-        duration_score = 5.0
-    elif contractor.max_hours is None:
-        duration_score = 10.0
-    else:
-        duration_score = 5 + 5 * min(
-            1.0, max(0.0, (contractor.max_hours - request.duration_hours) / 4)
-        )
 
-    language_score = 10.0 if request.language else 5.0
-    relevance_score = 20 * min(1.0, relevance * 4)
-    return (
-        ("Обязательные условия", 40.0),
-        ("Бюджет", round(budget_score, 2)),
-        ("Язык", language_score),
-        ("Длительность", round(duration_score, 2)),
-        ("Текстовая релевантность", round(relevance_score, 2)),
-    )
+def constraint_checks(item: Contractor, request: SearchRequest):
+    checks = [("Город", item.city == request.city),
+              ("Категория", request.category in item.categories),
+              ("Формат", request.event_format in item.event_formats),
+              ("Свободен", request.event_date.isoformat() not in item.busy_dates)]
+    if request.budget is not None:
+        checks.append(("Бюджет подходит", item.price <= request.budget))
+    if request.language:
+        checks.append(("Язык: " + request.language, all(v in item.languages for v in requested_languages(request))))
+    if request.duration_hours is not None:
+        checks.append((f"Длительность: {request.duration_hours} ч", item.max_hours is None or item.max_hours >= request.duration_hours))
+    return checks
+
+
+def rejection_reasons(item: Contractor, request: SearchRequest) -> tuple[str, ...]:
+    reasons = []
+    if request.event_date.isoformat() in item.busy_dates:
+        reasons.append("заняты")
+    if request.budget is not None and item.price > request.budget:
+        reasons.append("дороже бюджета")
+    if request.event_format not in item.event_formats:
+        reasons.append("не берут формат")
+    if request.language and not all(v in item.languages for v in requested_languages(request)):
+        reasons.append("не подходит язык")
+    if request.duration_hours is not None and item.max_hours is not None and item.max_hours < request.duration_hours:
+        reasons.append("не подходит длительность")
+    return tuple(reasons)
+
+
+def profile_quote(item: Contractor) -> str:
+    parts = _fragments(item.description)
+    part = next((p for p in parts if re.search(r"опыт|лет|юмор|манер", p, re.I)), parts[0] if parts else "")
+    experience = re.search(r"\b[Оо]пыт[^.!?]{0,70}?\b\d+\s+(?:лет|года?)\b", part)
+    if experience:
+        return experience.group(0)
+    return part if len(part) <= 240 else part[:240].rsplit(" ", 1)[0] + "…"
 
 
 def _explain(contractor: Contractor, request: SearchRequest) -> str:
     fragments = _fragments(contractor.description)
     evidence = _preference_evidence(request.preferences, contractor.description)
-    profile_fact = evidence or next(
-        (part for part in fragments if re.search(r"опыт|лет|юмор|манер", part, re.I)),
-        fragments[0] if fragments else "",
-    )
+    profile_fact = evidence or profile_quote(contractor)
     facts = [
         f"В профиле указано: «{profile_fact}»" if profile_fact else "Описание профиля отсутствует",
         f"свободен по календарю {request.event_date.strftime('%d.%m.%Y')}",
@@ -201,121 +222,114 @@ def _explain(contractor: Contractor, request: SearchRequest) -> str:
     return "; ".join(facts) + "."
 
 
-def recommend(
-    contractors: Iterable[Contractor], request: SearchRequest, limit: int | None = 3,
-    *, suggest_alternatives: bool = True
-) -> SearchResult:
-    pool = [
-        item
-        for item in contractors
-        if item.city == request.city and request.category in item.categories
-    ]
+def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: int | None = 3,
+              *, suggest_alternatives: bool = True, semantic_ranker=None,
+              related_categories: dict[str, list[str]] | None = None) -> SearchResult:
+    catalog = list(contractors)
+    city_pool = [c for c in catalog if c.city == request.city]
+    pool = [c for c in city_pool if request.category in c.categories]
+    pipeline = [("Профилей", len(catalog)), (request.city, len(city_pool)), (request.category, len(pool))]
+    stages = [("Формат", lambda c: request.event_format in c.event_formats),
+              ("Свободны", lambda c: request.event_date.isoformat() not in c.busy_dates)]
+    if request.budget is not None:
+        stages.append(("В бюджете", lambda c: c.price <= request.budget))
+    if request.language:
+        stages.append(("Язык", lambda c: all(v in c.languages for v in requested_languages(request))))
+    if request.duration_hours is not None:
+        stages.append(("Длительность", lambda c: c.max_hours is None or c.max_hours >= request.duration_hours))
+    eligible = pool
+    for label, predicate in stages:
+        eligible = [c for c in eligible if predicate(c)]
+        pipeline.append((label, len(eligible)))
+    rejected = [(c, rejection_reasons(c, request)) for c in pool]
+    counts = Counter(reason for _, reasons in rejected for reason in reasons)
+    near = tuple(NearMatch(c, reasons) for c, reasons in sorted(
+        ((c, r) for c, r in rejected if r), key=lambda pair: (len(pair[1]), pair[0].price, pair[0].id)))
+    mode, notice = "local", "Локальное сопоставление словоформ."
+    similarities = [0.0] * len(eligible)
+    if request.preferences.strip() and eligible:
+        if semantic_ranker is not None:
+            try:
+                similarities = list(semantic_ranker(request.preferences, [c.description for c in eligible]))
+                if len(similarities) != len(eligible) or not all(math.isfinite(v) and 0 <= v <= 1 for v in similarities):
+                    raise ValueError("Invalid similarity scores")
+                mode, notice = "embeddings", "Семантическая близость влияет на порядок, но не доказывает исполнение пожелания."
+            except Exception:
+                mode, notice = "fallback", "Семантический сервис недоступен. Использовано локальное сопоставление словоформ."
+        if mode != "embeddings":
+            similarities = _text_relevance(request.preferences, [c.description for c in eligible])
+    cards = []
+    for c, similarity in zip(eligible, similarities):
+        proof = _preference_evidence(request.preferences, c.description)
+        active = constraint_checks(c, request)
+        confirmed = len(active) + bool(proof)
+        total = len(active) + bool(request.preferences.strip())
+        match_percent = round(100 * confirmed / total)
+        budget_bonus = (max(0.0, 1 - c.price / request.budget) if request.budget else 0.0)
+        # Ranking is separate from the visible percentage of confirmed conditions.
+        preference_score = 80 * similarity if request.preferences.strip() else 0.0
+        factors = (("Текстовая релевантность", round(preference_score, 2)), ("Запас бюджета", round(20 * budget_bonus, 2)))
+        score = round(sum(value for _, value in factors), 2)
+        reason = ("Порядок: 80% близость пожеланий + 20% запас бюджета; при равенстве — цена и ID."
+                  if request.preferences.strip() else "Пожелания не заданы: порядок по цене, затем ID.")
+        cards.append(Recommendation(c, score, _explain(c, request), factors, match_percent,
+                                    tuple(label for label, passed in active if passed), proof, profile_quote(c), reason))
+    cards.sort(key=lambda r: (-r.score, r.contractor.price, r.contractor.id))
+    selected = tuple(cards[:limit])
+    pipeline.append((f"TOP-{len(selected)}" if limit is not None else "Подходят", len(selected)))
+    suggestions = _alternatives(catalog, request, related_categories or {}) if suggest_alternatives else ()
     if not pool:
-        return SearchResult(
-            status="category_absent",
-            message=f"В городе {request.city} нет подрядчиков категории «{request.category}».",
-        )
-
-    rejected = {"заняты": 0, "дороже бюджета": 0, "не берут формат": 0, "не подходит язык": 0, "не подходит длительность": 0}
-    eligible: list[Contractor] = []
-    requested_date = request.event_date.isoformat()
-
-    for item in pool:
-        reasons: list[str] = []
-        if requested_date in item.busy_dates:
-            reasons.append("заняты")
-        if request.budget is not None and item.price > request.budget:
-            reasons.append("дороже бюджета")
-        if request.event_format not in item.event_formats:
-            reasons.append("не берут формат")
-        if request.language and request.language not in item.languages:
-            reasons.append("не подходит язык")
-        if (
-            request.duration_hours is not None
-            and item.max_hours is not None
-            and item.max_hours < request.duration_hours
-        ):
-            reasons.append("не подходит длительность")
-
-        if reasons:
-            for reason in reasons:
-                rejected[reason] += 1
-        else:
-            eligible.append(item)
-
-    rejection_counts = tuple((key, value) for key, value in rejected.items() if value)
-    if not eligible:
-        detail = ", ".join(f"{name}: {count}" for name, count in rejection_counts)
-        return SearchResult(
-            status="conditions_not_met",
-            message=(f"В каталоге города {request.city} есть профили категории «{request.category}»: {len(pool)}. "
-                     f"На {request.event_date:%d.%m.%Y} по заданным условиям подходящих нет. "
-                     f"Причины отсева: {detail}. Причины могут пересекаться."),
-            rejection_counts=rejection_counts,
-            suggestions=_alternatives(pool, request) if suggest_alternatives else (),
-        )
-
-    relevance_scores = _text_relevance(request.preferences, [item.description for item in eligible])
-    relevance_scores = [
-        score if _preference_evidence(request.preferences, item.description) else 0.0
-        for item, score in zip(eligible, relevance_scores)
-    ]
-    factors_by_id = {
-        item.id: _score_factors(item, request, relevance)
-        for item, relevance in zip(eligible, relevance_scores)
-    }
-
-    def total_score(item: Contractor) -> float:
-        return round(sum(value for _, value in factors_by_id[item.id]), 2)
-
-    ranked = sorted(
-        eligible,
-        key=lambda item: (-total_score(item), item.price, item.id),
-    )
-    recommendations = tuple(
-        Recommendation(
-            item,
-            total_score(item),
-            _explain(item, request),
-            factors_by_id[item.id],
-        )
-        for item in ranked[:limit]
-    )
-    suffix = "" if limit is None or len(eligible) >= limit else f" Подходящих найдено только {len(eligible)}."
-    detail = "; ".join(f"{name}: {count}" for name, count in rejection_counts)
-    summary = f" В городе {request.city}, категория «{request.category}»: всего {len(pool)}."
-    if detail:
-        summary += f" Не прошли фильтры: {detail}. Причины могут пересекаться."
-    return SearchResult(
-        status="matched",
-        message=f"Подобрано {len(recommendations)} из {len(eligible)} подходящих подрядчиков.{suffix}{summary}",
-        recommendations=recommendations,
-        rejection_counts=rejection_counts,
-    )
+        status, message = "category_absent", f"В городе {request.city} нет подрядчиков категории «{request.category}»."
+    elif not eligible:
+        status = "conditions_not_met"
+        message = (f"В каталоге города {request.city} есть профили категории «{request.category}»: {len(pool)}. "
+                   f"На {request.event_date:%d.%m.%Y} по заданным условиям подходящих нет.")
+    else:
+        status = "matched"
+        message = f"Подобрано {len(selected)} из {len(eligible)} подходящих подрядчиков. В категории всего {len(pool)}."
+    if counts:
+        message += " Причины отсева: " + "; ".join(f"{name}: {count}" for name, count in counts.items()) + ". Причины могут пересекаться."
+    return SearchResult(status=status, message=message, recommendations=selected,
+                        rejection_counts=tuple(counts.items()), suggestions=suggestions,
+                        pipeline=tuple(pipeline), near_matches=near, matched_count=len(eligible),
+                        ranking_mode=mode, ranking_notice=notice)
 
 
-def _alternatives(pool: list[Contractor], request: SearchRequest) -> tuple[Suggestion, ...]:
+def _alternatives(catalog: list[Contractor], request: SearchRequest,
+                  related_categories: dict[str, list[str]]) -> tuple[Suggestion, ...]:
+    def matches(changed):
+        return {c.id for c in catalog if c.city == changed.city and changed.category in c.categories
+                and not rejection_reasons(c, changed)}
+
+    baseline = matches(request)
     suggestions = []
 
-    def count_matches(changed: SearchRequest) -> int:
-        result = recommend(pool, changed, limit=len(pool), suggest_alternatives=False)
-        return len(result.recommendations)
+    def offer(changed, kind, label):
+        found = matches(changed)
+        added = len(found - baseline)
+        if added:
+            suggestions.append(Suggestion(changed, len(found),
+                f"{label} → {len(found)} вариантов (+{added}). Остальные условия сохранены.", kind, added))
+        return added
 
-    for offset in range(1, (CALENDAR_END - request.event_date).days + 1):
-        changed = replace(request, event_date=request.event_date + timedelta(days=offset))
-        count = count_matches(changed)
-        if count:
-            suggestions.append(Suggestion(changed, count,
-                f"Если перенести мероприятие на {changed.event_date:%d.%m.%Y}, "
-                f"доступно вариантов: {count}. Остальные условия сохранены."))
-            break
-    for price in sorted({item.price for item in pool if request.budget is not None and item.price > request.budget}):
-        changed = replace(request, budget=price)
-        count = count_matches(changed)
-        if count:
-            suggestions.append(Suggestion(changed, count, (
-                f"Минимальное увеличение бюджета: +{price - request.budget:,} ₸ "
-                f"(до {price:,} ₸). Доступно вариантов: {count}. "
-                "Дата и остальные условия сохранены.").replace(",", " ")))
-            break
+    if not baseline:
+        for offset in range(1, (CALENDAR_END - request.event_date).days + 1):
+            changed = replace(request, event_date=request.event_date + timedelta(days=offset))
+            if offer(changed, "date", f"Дата {changed.event_date:%d.%m.%Y}"):
+                break
+        prices = sorted({c.price for c in catalog if c.city == request.city and request.category in c.categories
+                         and request.budget is not None and c.price > request.budget})
+        for price in prices:
+            if offer(replace(request, budget=price), "budget",
+                     f"Бюджет +{price - request.budget:,} ₸ (до {price:,} ₸)".replace(",", " ")):
+                break
+    if request.language:
+        offer(replace(request, language=None), "language", "Любой язык")
+    if request.duration_hours:
+        for hours in range(request.duration_hours - 1, 0, -1):
+            if offer(replace(request, duration_hours=hours), "duration", f"Сократить до {hours} ч"):
+                break
+    for category in related_categories.get(request.category, []):
+        if category != request.category:
+            offer(replace(request, category=category), "category", f"Сменить категорию на «{category}»")
     return tuple(suggestions)

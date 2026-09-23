@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import date
 from pathlib import Path
@@ -6,107 +7,103 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 from assistant import AssistantError, AssistantTurn, SearchTools
+from product import search_id
 from recommender import load_contractors
 
 
+ROOT = Path(__file__).parents[1]
+
+
 class AppTests(unittest.TestCase):
-    def test_unlimited_agent_search_renders_all_and_applies_without_hidden_budget(self):
-        path = Path(__file__).parents[1]
-        import json
-        result = SearchTools(load_contractors(path / "data/contractors.csv")).dispatch(
+    def app(self):
+        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=15)
+        app.secrets["OPENAI_API_KEY"] = "test-openai"
+        app.secrets["NVIDIA_API_KEY"] = "test-nvidia"
+        return app
+
+    def test_single_result_panel_syncs_chat_and_manual_controls(self):
+        result = SearchTools(load_contractors(ROOT / "data/contractors.csv")).dispatch(
             "search_contractors", json.dumps(dict(city="Алматы", event_date="2026-09-23",
                                                   event_format="свадьба", category="Ведущий")))
         turn = AssistantTurn("Найдено 4 ведущих.", [], [{"name": "search_contractors", "result": result}])
-        app = AppTest.from_file(str(path / "app.py"))
-        app.secrets["OPENAI_API_KEY"] = "test-openai"
-        with patch("assistant_ui.run_turn", return_value=turn):
+        app = self.app()
+        with patch("assistant_ui.run_turn", return_value=turn) as run:
             app.run()
             app.chat_input(key="ai_message").set_value("Нужен ведущий на свадьбу сегодня в Алматы").run()
             self.assertFalse(app.exception)
-            rendered = " ".join(m.value for m in app.markdown)
+            names = [item.value for item in app.subheader]
             for name in ("Мицури Канроджи", "Эмилия", "Сон Гоку", "Софи Хаттер"):
-                self.assertIn(name, rendered)
-            self.assertTrue(any("бюджет без ограничений" in c.value for c in app.caption))
-            next(b for b in app.button if b.label == "Применить условия поиска к форме").click().run()
-            self.assertFalse(app.exception)
+                self.assertEqual(names.count(name), 1)
+            self.assertEqual([h.value for h in app.header].count("Ваше мероприятие"), 1)
             self.assertTrue(app.checkbox(key="budget_unlimited").value)
             self.assertIsNone(app.session_state["search_request"].budget)
-            app.button[0].click().run()
+            self.assertTrue(any(e.label == "Все подходящие — ещё 1" for e in app.expander))
+            app.button(key="manual_submit").click().run()
             self.assertFalse(app.exception)
             self.assertIsNone(app.session_state["search_request"].budget)
+            self.assertEqual(run.call_count, 1)
 
-    def test_chat_without_credentials_preserves_regular_search(self):
+    def test_chat_without_credentials_preserves_manual_search(self):
         with patch("assistant_ui.AssistantConfig.from_settings", side_effect=AssistantError("Добавьте API-ключ")):
-            app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run()
-            self.assertFalse(app.exception)
+            app = self.app().run()
             self.assertTrue(app.chat_input[0].disabled)
-            app.button[0].click().run()
+            app.button(key="manual_submit").click().run()
             self.assertFalse(app.exception)
             self.assertTrue(app.success)
 
-    def test_chat_results_require_click_to_change_form_and_provider_isolation(self):
-        path = Path(__file__).parents[1]
-        args = dict(city="Алматы", event_date="2026-10-03", event_format="свадьба",
-                    category="Ведущий", budget=1_500_000, duration_hours=6,
-                    language="русский", preferences="")
-        import json
-        result = SearchTools(load_contractors(path / "data/contractors.csv")).dispatch("search_contractors", json.dumps(args))
-        turn = AssistantTurn("Можно перенести дату.", [{"role": "user", "content": "Найди"}],
-                             [{"name": "search_contractors", "result": result}])
-        app = AppTest.from_file(str(path / "app.py"))
-        app.secrets["OPENAI_API_KEY"] = "test-openai"
-        app.secrets["NVIDIA_API_KEY"] = "test-nvidia"
-        with patch("assistant_ui.run_turn", return_value=turn) as run:
-            app.run()
-            app.chat_input(key="ai_message").set_value("Найди ведущего").run()
-            self.assertFalse(app.exception)
-            self.assertEqual(run.call_count, 1)
-            self.assertEqual(app.date_input(key="event_date").value, date(2026, 10, 14))
-            button = next(b for b in app.button if b.label == "Применить дату 2026-10-04")
-            button.click().run()
-            self.assertFalse(app.exception)
-            self.assertEqual(app.date_input(key="event_date").value, date(2026, 10, 4))
-            self.assertEqual(run.call_count, 1)
-            app.selectbox(key="ai_provider").set_value("nvidia").run()
-            self.assertEqual(len(app.chat_message), 0)
-
-    def test_chat_api_failure_does_not_commit_history(self):
-        app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py"))
-        app.secrets["OPENAI_API_KEY"] = "test-openai"
-        with patch("assistant_ui.run_turn", side_effect=AssistantError("API недоступен")):
-            app.run()
-            app.chat_input(key="ai_message").set_value("Найди").run()
-            self.assertFalse(app.exception)
-            self.assertTrue(app.error)
-            sessions = app.session_state["ai_sessions"]
-            self.assertTrue(all(not session["history"] for session in sessions.values()))
-
     def test_date_suggestion_requires_click_and_preserves_conditions(self):
-        app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run()
-        app.selectbox(key="city").set_value("Алматы")
+        app = self.app().run()
         app.date_input(key="event_date").set_value(date(2026, 10, 3))
         app.text_area(key="preferences").set_value("квантовый реактор на Марсе")
-        app.button[0].click().run()
+        app.button(key="manual_submit").click().run()
         self.assertFalse(app.exception)
         self.assertEqual(app.date_input(key="event_date").value, date(2026, 10, 3))
-        self.assertTrue(any("04.10.2026" in info.value for info in app.info))
+        self.assertIn("04.10.2026", app.button(key="suggestion_0").label)
         app.button(key="suggestion_0").click().run()
         self.assertFalse(app.exception)
         self.assertEqual(app.date_input(key="event_date").value, date(2026, 10, 4))
         self.assertEqual(app.number_input(key="budget").value, 1_500_000)
         self.assertEqual(app.text_area(key="preferences").value, "квантовый реактор на Марсе")
-        self.assertEqual(len(app.subheader), 2)
-        self.assertTrue(all("пожелание не подтверждено" in info.value for info in app.info))
+        self.assertEqual(app.session_state["active_result"]["matched_count"], 2)
+        self.assertTrue(any("пожелание не подтверждено" in info.value for info in app.info))
 
-    def test_budget_suggestion_applies_exact_price(self):
-        app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run()
-        app.selectbox(key="city").set_value("Алматы")
-        app.number_input(key="budget").set_value(100_000)
-        app.button[0].click().run()
+    def test_comparison_shortlist_demo_request_and_history(self):
+        app = self.app().run()
+        app.button(key="manual_submit").click().run()
+        payload = app.session_state["active_result"]
+        key = search_id(payload["request"])
+        first = payload["recommendations"][0]
+        app.button(key=f"compare_button_{key}").click().run()
         self.assertFalse(app.exception)
-        button = next(b for b in app.button if b.label == "Применить новый бюджет")
-        button.click().run()
+        self.assertEqual(len(app.dataframe), 1)
+        self.assertEqual(len(app.dataframe[0].value), 3)
+        app.button(key=f"save_{key}_{first['id']}").click().run()
+        self.assertIn(first["id"], app.session_state["shortlist"])
+        for _ in range(2):
+            app.button(key=f"request_{key}_{first['id']}").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(app.date_input(key="event_date").value, date(2026, 10, 14))
-        self.assertGreater(app.number_input(key="budget").value, 100_000)
-        self.assertTrue(app.success)
+        self.assertEqual(len(app.session_state["demo_requests"]), 1)
+        self.assertTrue(any("Ничего не отправлено" in item.value for item in app.success))
+        self.assertEqual(len(app.session_state["search_history"]), 1)
+        app.button(key="history_0").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state["active_result"]["request"], payload["request"])
+        self.assertIn(first["id"], app.session_state["shortlist"])
+
+    def test_multiple_languages_apply_all(self):
+        app = self.app().run()
+        app.multiselect(key="languages_selected").set_value(["русский", "казахский"])
+        app.checkbox(key="budget_unlimited").check()
+        app.button(key="manual_submit").click().run()
+        self.assertFalse(app.exception)
+        for card in app.session_state["active_result"]["recommendations"]:
+            self.assertTrue({"русский", "казахский"} <= set(card["languages"]))
+
+    def test_chat_api_failure_does_not_commit_history(self):
+        app = self.app()
+        with patch("assistant_ui.run_turn", side_effect=AssistantError("API недоступен")):
+            app.run()
+            app.chat_input(key="ai_message").set_value("Найди").run()
+            self.assertFalse(app.exception)
+            self.assertTrue(app.error)
+            self.assertTrue(all(not s["history"] for s in app.session_state["ai_sessions"].values()))

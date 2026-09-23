@@ -66,7 +66,9 @@ class RecommenderTests(unittest.TestCase):
         base = replace(self.contractors[0], categories=("Ведущий",), price=100_000,
                        busy_dates=frozenset({"2026-12-31"}))
         self.assertFalse(recommend([base], self.base_request(event_date=date(2026, 12, 31))).suggestions)
-        self.assertFalse(recommend([replace(base, languages=("английский",))], self.base_request()).suggestions)
+        alternatives = recommend([replace(base, languages=("английский",))], self.base_request()).suggestions
+        self.assertEqual([s.kind for s in alternatives], ["language"])
+        self.assertIsNone(alternatives[0].request.language)
 
     def test_sparse_category_summary_is_visible_in_message(self):
         result = recommend(self.contractors, self.base_request(category="Флорист"))

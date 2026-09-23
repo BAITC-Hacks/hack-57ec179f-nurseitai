@@ -1,3 +1,4 @@
 streamlit>=1.39,<2
 openai>=1.68,<3
+snowballstemmer>=2.2,<4
 
