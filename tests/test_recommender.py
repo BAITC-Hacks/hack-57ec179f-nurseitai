@@ -70,11 +70,11 @@ class RecommenderTests(unittest.TestCase):
         self.assertEqual([s.kind for s in alternatives], ["language"])
         self.assertIsNone(alternatives[0].request.language)
 
-    def test_sparse_category_summary_is_visible_in_message(self):
+    def test_success_summary_is_compact_and_reasons_remain_available(self):
         result = recommend(self.contractors, self.base_request(category="Флорист"))
         self.assertEqual(len(result.recommendations), 1)
-        self.assertIn("всего 2", result.message)
-        self.assertIn("заняты: 1", result.message)
+        self.assertEqual(result.message, "Подобрано 1 из 1 подходящих подрядчиков.")
+        self.assertEqual(dict(result.rejection_counts)["заняты"], 1)
 
     @classmethod
     def setUpClass(cls):

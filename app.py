@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import date
 from pathlib import Path
 
@@ -34,15 +35,17 @@ try:
     settings = dict(st.secrets)
 except FileNotFoundError:
     settings = {}
+
+
+def server_flag(name):
+    return str(settings.get(name, os.getenv(name, "false"))).strip().lower() in ("true", "1", "yes", "on")
+
+
+provider = str(settings.get("AI_PROVIDER", os.getenv("AI_PROVIDER", "openai"))).strip().lower()
+embeddings_enabled = server_flag("EMBEDDINGS_ENABLED")
+debug = server_flag("AI_DEBUG")
 with st.sidebar:
     st.caption(f"{len(contractors)} профилей · календарь до 31.12.2026")
-    with st.expander("Настройки AI"):
-        provider = st.selectbox("Провайдер ИИ", ["openai", "nvidia"], key="ai_provider")
-        embeddings_enabled = st.checkbox("Семантическое ранжирование", key="use_embeddings",
-            help="Применяется к следующему поиску. Пожелания и описания прошедших фильтры профилей отправляются в OpenAI Embeddings API. Используется квота API.")
-        debug = st.checkbox("Режим демонстрации: вызовы функций", key="debug")
-        st.caption("Чат отправляет сообщения и результаты поиска выбранному провайдеру. "
-                   "Embeddings используют OpenAI отдельно, независимо от провайдера чата.")
 
 ranker = None
 if embeddings_enabled:

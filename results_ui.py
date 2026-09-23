@@ -1,7 +1,15 @@
+import re
+
 import streamlit as st
 
 from assistant_ui import describe_request
 from product import comparison_rows, create_demo_request, detailed_reasons, search_id, toggle_shortlist
+
+
+def render_profile_feature(value):
+    # Keep the original evidence unchanged; repair the extracted phrase only for display.
+    feature = re.sub(r"^опытом\b", "Опыт", value.strip(), flags=re.I)
+    st.write(f"**{feature}**" if re.match(r"^опыт\b", feature, flags=re.I) else feature or "Описание отсутствует.")
 
 
 def render_result(payload, on_request, debug=False):
@@ -30,11 +38,11 @@ def render_result(payload, on_request, debug=False):
             if rec.get("profile_facts"):
                 for fact in rec["profile_facts"]:
                     if fact["source"] == "description":
-                        st.write(f"В профиле указано: «{fact['value']}»")
+                        render_profile_feature(fact["value"])
                     else:
                         st.caption(f"{fact['label']}: {fact['value']}")
             else:
-                st.write(f"В профиле указано: «{rec['profile_quote']}»" if rec["profile_quote"] else "Описание отсутствует.")
+                render_profile_feature(rec["profile_quote"])
             if request["preferences"]:
                 if rec["preference_evidence"]:
                     st.write(f"★ Фрагменты по пожеланию: «{rec['preference_evidence']}»")
@@ -42,12 +50,6 @@ def render_result(payload, on_request, debug=False):
                     st.info("Обязательные условия подходят, но пожелание не подтверждено описанием")
             else:
                 st.caption("Дополнительные пожелания не заданы.")
-            with st.expander("Почему это место в списке"):
-                st.write(rec["ranking_reason"])
-                st.caption(payload.get("ranking_notice", ""))
-                for label, value in rec["factors"]:
-                    st.write(f"{label}: {value:.2f}")
-                st.caption("Это оценка порядка выдачи, отдельная от Match.")
             saved = rec["id"] in st.session_state.get("shortlist", {})
             st.button("Убрать из shortlist" if saved else "♡ В shortlist", key=f"save_{key}_{rec['id']}",
                       on_click=toggle_shortlist, args=(st.session_state, rec, request))

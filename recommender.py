@@ -316,7 +316,7 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
                    (f" на {request.event_date:%d.%m.%Y}." if request.event_date else "."))
     else:
         status = "matched"
-        message = f"Подобрано {len(selected)} из {len(eligible)} подходящих подрядчиков. В категории всего {len(pool)}."
+        message = f"Подобрано {min(3, len(selected))} из {len(eligible)} подходящих подрядчиков."
     clarification = ""
     if not eligible:
         if len(requested_categories(request)) > 1:
@@ -327,7 +327,7 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
             clarification = "Какое условие готовы изменить? Можно выбрать проверенный вариант ниже или уточнить запрос сообщением."
         else:
             clarification = "По этому запросу вариантов нет. Какую именно задачу должен решить подрядчик и какое условие можно изменить?"
-    if counts:
+    if counts and not eligible:
         message += " Причины отсева: " + "; ".join(f"{name}: {count}" for name, count in counts.items()) + ". Причины могут пересекаться."
     return SearchResult(status=status, message=message, recommendations=selected,
                         rejection_counts=tuple(counts.items()), suggestions=suggestions,
