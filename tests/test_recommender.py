@@ -58,7 +58,27 @@ class RecommenderTests(unittest.TestCase):
         result = recommend(self.contractors, request)
         self.assertEqual(result.status, "category_absent")
 
+    def test_preferences_are_scored_and_explained(self):
+        request = SearchRequest(
+            city="Алматы",
+            event_date=date(2026, 10, 14),
+            event_format="свадьба",
+            category="Ведущий",
+            budget=1_500_000,
+            language="русский",
+            preferences="интеллигентный ведущий для деловой аудитории",
+        )
+        result = recommend(self.contractors, request)
+        self.assertEqual(result.status, "matched")
+        self.assertTrue(result.recommendations)
+        self.assertTrue(
+            all(
+                any(name == "Текстовая релевантность" for name, _ in item.factors)
+                for item in result.recommendations
+            )
+        )
+        self.assertIn("пожелани", result.recommendations[0].explanation)
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -10,10 +12,6 @@ from typing import Iterable
 
 def _split(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split("|") if item.strip())
-
-
-def _tokens(value: str) -> set[str]:
-    return set(re.findall(r"[а-яёa-z0-9]+", value.casefold()))
 
 
 @dataclass(frozen=True)
@@ -40,6 +38,7 @@ class SearchRequest:
     budget: int
     duration_hours: int | None = None
     language: str | None = None
+    preferences: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,6 +46,7 @@ class Recommendation:
     contractor: Contractor
     score: float
     explanation: str
+    factors: tuple[tuple[str, float], ...]
 
 
 @dataclass(frozen=True)
@@ -79,28 +79,71 @@ def load_contractors(path: str | Path) -> list[Contractor]:
     return contractors
 
 
-def _score(contractor: Contractor, request: SearchRequest) -> float:
-    # Every ranked contractor already passed the hard constraints. The score
-    # differentiates candidates transparently without letting an LLM reorder them.
+def _word_ngrams(value: str) -> list[str]:
+    words = re.findall(r"[а-яёa-z0-9]+", value.casefold())
+    terms = [word for word in words if len(word) > 2]
+    terms.extend(f"{left}_{right}" for left, right in zip(words, words[1:]))
+    return terms
+
+
+def _text_relevance(query: str, documents: list[str]) -> list[float]:
+    """Return deterministic TF-IDF cosine similarity for each document."""
+    if not query.strip() or not documents:
+        return [0.0] * len(documents)
+
+    tokenized = [_word_ngrams(query), *(_word_ngrams(document) for document in documents)]
+    document_count = len(tokenized)
+    frequencies = Counter(term for terms in tokenized for term in set(terms))
+
+    def vector(terms: list[str]) -> dict[str, float]:
+        counts = Counter(terms)
+        total = max(1, sum(counts.values()))
+        return {
+            term: count / total * (math.log((1 + document_count) / (1 + frequencies[term])) + 1)
+            for term, count in counts.items()
+        }
+
+    vectors = [vector(terms) for terms in tokenized]
+    query_vector = vectors[0]
+    query_norm = math.sqrt(sum(value * value for value in query_vector.values()))
+    if query_norm == 0:
+        return [0.0] * len(documents)
+
+    scores: list[float] = []
+    for candidate in vectors[1:]:
+        candidate_norm = math.sqrt(sum(value * value for value in candidate.values()))
+        dot = sum(value * candidate.get(term, 0.0) for term, value in query_vector.items())
+        scores.append(dot / (query_norm * candidate_norm) if candidate_norm else 0.0)
+    return scores
+
+
+def _score_factors(
+    contractor: Contractor, request: SearchRequest, relevance: float
+) -> tuple[tuple[str, float], ...]:
     budget_cushion = max(0.0, 1.0 - contractor.price / request.budget)
-    description_overlap = len(
-        _tokens(contractor.description)
-        & _tokens(f"{request.event_format} {request.category} {request.language or ''}")
+    budget_score = 10 + 10 * budget_cushion
+
+    if request.duration_hours is None:
+        duration_score = 5.0
+    elif contractor.max_hours is None:
+        duration_score = 10.0
+    else:
+        duration_score = 5 + 5 * min(
+            1.0, max(0.0, (contractor.max_hours - request.duration_hours) / 4)
+        )
+
+    language_score = 10.0 if request.language else 5.0
+    relevance_score = 20 * min(1.0, relevance * 4)
+    return (
+        ("Обязательные условия", 40.0),
+        ("Бюджет", round(budget_score, 2)),
+        ("Язык", language_score),
+        ("Длительность", round(duration_score, 2)),
+        ("Текстовая релевантность", round(relevance_score, 2)),
     )
-    duration_buffer = 0.0
-    if request.duration_hours is not None and contractor.max_hours is not None:
-        duration_buffer = min(1.0, (contractor.max_hours - request.duration_hours) / 4)
-
-    return round(
-        50
-        + 25 * budget_cushion
-        + 15 * min(1.0, description_overlap / 2)
-        + 10 * max(0.0, duration_buffer),
-        2,
-    )
 
 
-def _explain(contractor: Contractor, request: SearchRequest) -> str:
+def _explain(contractor: Contractor, request: SearchRequest, relevance: float) -> str:
     facts = [
         f"свободен {request.event_date.strftime('%d.%m.%Y')}",
         f"берёт формат «{request.event_format}»",
@@ -113,6 +156,11 @@ def _explain(contractor: Contractor, request: SearchRequest) -> str:
             facts.append("услуга не привязана к длительности присутствия")
         else:
             facts.append(f"доступен до {contractor.max_hours} ч")
+    if request.preferences.strip():
+        if relevance > 0:
+            facts.append("описание профиля связано с указанными пожеланиями")
+        else:
+            facts.append("прямого совпадения с дополнительными пожеланиями не найдено")
     return "; ".join(facts).capitalize() + "."
 
 
@@ -166,12 +214,50 @@ def recommend(
             rejection_counts=rejection_counts,
         )
 
+    query_text = " ".join(
+        part
+        for part in (
+            request.category,
+            request.event_format,
+            request.language or "",
+            request.preferences,
+        )
+        if part
+    )
+    documents = [
+        " ".join(
+            [
+                *item.categories,
+                *item.event_formats,
+                *item.languages,
+                item.description,
+            ]
+        )
+        for item in eligible
+    ]
+    relevance_scores = _text_relevance(query_text, documents)
+    factors_by_id = {
+        item.id: _score_factors(item, request, relevance)
+        for item, relevance in zip(eligible, relevance_scores)
+    }
+    relevance_by_id = {
+        item.id: relevance for item, relevance in zip(eligible, relevance_scores)
+    }
+
+    def total_score(item: Contractor) -> float:
+        return round(sum(value for _, value in factors_by_id[item.id]), 2)
+
     ranked = sorted(
         eligible,
-        key=lambda item: (-_score(item, request), item.price, item.id),
+        key=lambda item: (-total_score(item), item.price, item.id),
     )
     recommendations = tuple(
-        Recommendation(item, _score(item, request), _explain(item, request))
+        Recommendation(
+            item,
+            total_score(item),
+            _explain(item, request, relevance_by_id[item.id]),
+            factors_by_id[item.id],
+        )
         for item in ranked[:limit]
     )
     suffix = "" if len(eligible) >= limit else f" Подходящих найдено только {len(eligible)}."
@@ -181,4 +267,3 @@ def recommend(
         recommendations=recommendations,
         rejection_counts=rejection_counts,
     )
-
