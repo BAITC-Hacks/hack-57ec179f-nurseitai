@@ -58,11 +58,6 @@ def render_result(payload, on_request, debug=False):
             saved = rec["id"] in st.session_state.get("shortlist", {})
             st.button("Убрать из shortlist" if saved else "♡ В shortlist", key=f"save_{key}_{rec['id']}",
                       on_click=toggle_shortlist, args=(st.session_state, rec, request))
-            with st.expander("Связаться"):
-                st.caption("В анонимизированном каталоге нет контактов. Можно подготовить текст обращения.")
-                st.code(f"Здравствуйте! Нужен {request['category'].lower()} на {request['event_format']} "
-                        f"в городе {request['city']} {request['event_date']}. "
-                        "Подтвердите, пожалуйста, доступность и итоговую стоимость.", language=None)
 
     if cards:
         columns = st.columns(min(3, len(cards)))
