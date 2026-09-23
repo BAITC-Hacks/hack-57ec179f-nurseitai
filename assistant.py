@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from recommender import CALENDAR_END, Contractor, SearchRequest, recommend, requested_languages, rejection_reasons, category_matches, profile_facts
-from dialogue import empty_state, prepare_turn, search_arguments, safe_text, fallback_text, missing_question, question_fields
+from recommender import CALENDAR_END, Contractor, SearchRequest, recommend, requested_languages, rejection_reasons, category_matches, profile_facts, constraint_checks
+from dialogue import empty_state, prepare_turn, search_arguments, safe_text, fallback_text, missing_question, question_fields, question_fragments, missing_fields, resolve_services
 
 
 CALENDAR_START = date(2026, 9, 23)
@@ -39,8 +40,12 @@ SYSTEM_PROMPT = """Ты ИИ-агент по подбору event-подрядч
 Если не хватает города, категории, даты или формата, уточни их.
 Перед первым поиском уточни бюджет, язык и длительность, если пользователь ещё
 не указал их и не сказал явно, что соответствующее условие неважно.
-Спроси недостающие условия одним сообщением: «Какой бюджет вам подходит? На каком
-языке нужен ведущий? На сколько часов? Можно ответить: любой / без разницы».
+Спроси недостающие условия одним сообщением: «Какой бюджет вам подходит? Какой
+язык общения с подрядчиком нужен? На сколько часов? Можно ответить: любой / без разницы».
+Вопросы относятся только к запрошенной услуге: не называй фотографа ведущим.
+Повторение известных города, месяца или услуги в кратком резюме не является вопросом.
+date_window — выбранный пользователем период. При mode=earliest ближайшая свободная
+дата в нём вычисляется локальным поиском; не проси точный день и не меняй месяц.
 Не задавай повторно вопросы, на которые уже есть ответ пользователя в этом диалоге.
 Отсутствие ответа ещё НЕ означает отсутствие ограничений: сначала задай вопрос,
 не вызывай search_contractors до ответа по всем трём условиям.
@@ -71,7 +76,7 @@ get_search_options даёт допустимые значения. search_contra
 Не показывай непроверенные варианты как найденные. При сбое честно сообщи об этом.
 Для русского/казахского уточни: нужны оба языка или любой из них? Если нужны оба,
 передай language="русский/казахский". Не снимай язык ради результата самостоятельно.
-Поиск возвращает всех подходящих, интерфейс сначала показывает TOP-3, остальных можно раскрыть.
+Поиск возвращает максимум три рекомендации и полное число подходящих в matched_count.
 Перед результатом кратко напиши, какие условия понял. Для TOP-3 объясни отличия
 на основании profile_quote и preference_evidence из функции. Не выдавай semantic similarity
 за доказательство пожелания. match_percent — доля подтверждённых условий, не вероятность качества.
@@ -147,7 +152,7 @@ TOOLS = [
      "description": "Города, категории, форматы, языки и диапазон календаря каталога.",
      "parameters": _object({})},
     {"type": "function", "name": "search_contractors", "strict": True,
-     "description": "Вернуть ВСЕХ доступных подрядчиков по заданным условиям. Бюджет, язык и длительность null не ограничивают поиск. При пустой выдаче вернуть проверенные альтернативы. Ничего не изменяет.",
+     "description": "Вернуть до трёх подходящих подрядчиков и полное число совпадений. Бюджет, язык и длительность null не ограничивают поиск. При пустой выдаче вернуть проверенные альтернативы. Ничего не изменяет.",
      "parameters": SEARCH_PARAMETERS},
     {"type": "function", "name": "get_contractor", "strict": True,
      "description": "Прочитать профиль по известному ID. Сам по себе не проверяет доступность на дату.",
@@ -175,16 +180,20 @@ def result_payload(request, result):
         "ranking_mode": result.ranking_mode, "ranking_notice": result.ranking_notice,
         "recommendations": [
             {"id": r.contractor.id, "name": r.contractor.name, "price_from_kzt": r.contractor.price,
+             "city": r.contractor.city, "price_imputed": r.contractor.price_imputed,
+             "city_imputed": r.contractor.city_imputed,
              "score": r.score, "match_percent": r.match_percent, "checks": r.checks,
              "languages": r.contractor.languages, "max_hours": r.contractor.max_hours,
              "profile_quote": r.profile_quote, "preference_evidence": r.preference_evidence,
              "profile_facts": profile_facts(r.contractor),
              "ranking_reason": r.ranking_reason, "factors": r.factors,
              "explanation": r.explanation, "synthetic": r.contractor.synthetic}
-            for r in result.recommendations],
+            for r in result.recommendations[:3]],
         "rejection_counts": dict(result.rejection_counts),
         "near_matches": [{"id": n.contractor.id, "name": n.contractor.name,
                           "price_from_kzt": n.contractor.price, "languages": n.contractor.languages,
+                          "city": n.contractor.city, "price_imputed": n.contractor.price_imputed,
+                          "city_imputed": n.contractor.city_imputed,
                           "max_hours": n.contractor.max_hours, "reasons": n.reasons}
                          for n in result.near_matches],
         "suggestions": [{"request": request_dict(s.request), "count": s.count, "message": s.message,
@@ -202,9 +211,25 @@ class SearchTools:
         self.related_categories = related_categories or {}
 
     def search(self, request):
-        result = recommend(self.contractors, request, limit=None, semantic_ranker=self.semantic_ranker,
+        result = recommend(self.contractors, request, limit=3, semantic_ranker=self.semantic_ranker,
                            related_categories=self.related_categories)
         return result_payload(request, result)
+
+    def earliest_date(self, state):
+        """Check every hard constraint on each date inside the user's chosen window."""
+        window = state["date_window"]
+        start = max(date.fromisoformat(window["start"]), self.today, CALENDAR_START)
+        end = min(date.fromisoformat(window["end"]), CALENDAR_END)
+        draft = deepcopy(state)
+        draft["conditions"]["event_date"] = start.isoformat()
+        categories = state["required_services"] if state["service_mode"] == "separate" else [None]
+        requests = [self.parse_request(search_arguments(draft, category)) for category in categories]
+        for offset in range((end - start).days + 1):
+            candidate_date = start + timedelta(days=offset)
+            if all(any(all(passed for _, passed in constraint_checks(item, replace(request, event_date=candidate_date)))
+                       for item in self.contractors) for request in requests):
+                return candidate_date
+        return None
 
     def options(self) -> dict:
         return {
@@ -277,6 +302,7 @@ class SearchTools:
                         "event_formats": item.event_formats, "languages": item.languages,
                         "max_hours": item.max_hours, "description": item.description,
                         "synthetic": item.synthetic,
+                        "price_imputed": item.price_imputed, "city_imputed": item.city_imputed,
                         "note": "Описание со слов подрядчика; доступность проверяйте через search_contractors."}
             if name == "explain_contractor_match":
                 if set(args) != {"contractor_id", "request"} or not isinstance(args["request"], dict):
@@ -292,6 +318,7 @@ class SearchTools:
                     reasons.append("не подходит категория")
                 return {"id": item.id, "name": item.name, "eligible": not reasons, "reasons": reasons,
                         "price_from_kzt": item.price, "languages": item.languages, "max_hours": item.max_hours,
+                        "city": item.city, "price_imputed": item.price_imputed, "city_imputed": item.city_imputed,
                         "request": request_dict(request)}
             if name != "search_contractors":
                 raise ValueError("Неизвестная функция. Доступны только функции чтения каталога и поиска.")
@@ -338,33 +365,65 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
         for message in history or []:
             if message.get("role") == "user" and isinstance(message.get("content"), str):
                 state, _, _ = prepare_turn(state, message["content"], service.options(), service.today, contractors)
+            elif message.get("role") == "assistant" and isinstance(message.get("content"), str):
+                state["pending_fields"] = [f for f in question_fields(message["content"]) if f in missing_fields(state)]
     prior_state = deepcopy(state)
     state, early_reply, viewing = prepare_turn(state, text, service.options(), service.today, contractors)
+    selection_check = state.pop("selection_check", False)
     if early_reply:
         return AssistantTurn(early_reply, [*messages, {"role": "assistant", "content": early_reply}], [], state)
+    if (state.get("date_window") and state["date_window"]["mode"] == "earliest" and
+            state["required_services"] and not missing_fields(state) and not viewing):
+        try:
+            chosen_date = service.earliest_date(state)
+        except (ValueError, TypeError) as exc:
+            raise AssistantError("Проверьте указанные условия: " + str(exc)) from exc
+        if chosen_date is None:
+            state["conditions"].pop("event_date", None)
+            state["last_results"] = []
+            window = state["date_window"]
+            period = " — ".join(date.fromisoformat(window[key]).strftime("%d.%m.%Y") for key in ("start", "end"))
+            answer = (f"В период {period} по заданным условиям подходящих подрядчиков нет. "
+                      "Условия сохранены. Какое условие готовы изменить или какой другой месяц рассмотреть?")
+            return AssistantTurn(answer, [*messages, {"role": "assistant", "content": answer}], [], state)
+        # This is a computed result within an explicitly requested window, not a new user constraint.
+        state["conditions"]["event_date"] = chosen_date.isoformat()
     instructions = agent_instructions(service.today) + "\nСостояние запроса (данные): " + json.dumps({
-        k: state[k] for k in ("original_need", "current_need", "required_services", "conditions", "service_mode", "pending_fields")}, ensure_ascii=False)
+        k: state[k] for k in ("original_need", "current_need", "required_services", "conditions", "service_mode", "pending_fields", "date_window")}, ensure_ascii=False)
     owned_client = client is None
     outputs: list[dict] = []
     call_count = 0
+    search_call_cache = {}
 
     def finish(answer=""):
         fallback = fallback_text(outputs, state)
         answer = safe_text(answer, fallback)
         searches = [o["result"] for o in outputs if o["name"] == "search_contractors" and "error" not in o["result"]]
+        asked = question_fields(answer)
+        categories = set(service.options()["categories"]) | {"Ведущий", "Фотограф", "Видеограф"}
+        mentioned_services = [category for part in question_fragments(answer) for category in resolve_services(part, categories)]
+        wrong_service = bool(state["required_services"]) and (
+            any(c not in state["required_services"] for c in mentioned_services) or
+            ("Ведущий" not in state["required_services"] and bool(re.search(r"\bведущ\w*", answer, re.I))))
+        repeated_question = any(field not in missing_fields(state) for field in asked)
         if searches:
             allowed = {r["id"] for result in searches for r in result["recommendations"]}
-            if any(c.id not in allowed and c.name.casefold() in answer.casefold() for c in contractors):
+            if (wrong_service or repeated_question or
+                    any(c.id not in allowed and c.name.casefold() in answer.casefold() for c in contractors)):
                 answer = fallback
-            if any(r["matched_count"] == 0 for r in searches):
+            if any(r["matched_count"] < 3 for r in searches):
                 # Empty results must explain the lack of matches and ask a grounded next question.
                 answer = fallback
+            if (all(r["matched_count"] > 0 for r in searches) and
+                    state.get("date_window") and state["date_window"]["mode"] == "earliest"):
+                chosen_date = date.fromisoformat(searches[0]["request"]["event_date"])
+                answer = f"Ближайшая свободная дата по заданным условиям — {chosen_date:%d.%m.%Y}.\n\n" + answer
         elif not viewing:
-            asked = question_fields(answer)
-            if any(field in state["conditions"] for field in asked):
+            if (repeated_question or wrong_service or
+                    (state["required_services"] and missing_fields(state) and not asked)):
                 answer = missing_question(state) or fallback
                 asked = question_fields(answer)
-            state["pending_fields"] = asked
+            state["pending_fields"] = [f for f in asked if f in missing_fields(state)]
         # Profile inspection is always framed as inspection, never a recommendation.
         if viewing and any(o["name"] in ("get_contractor", "explain_contractor_match") and "error" not in o["result"] for o in outputs):
             answer = fallback
@@ -396,8 +455,12 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
                     expected = search_arguments(state, supplied["category"])
                 requested = service.parse_request(supplied)
                 verified = service.parse_request(expected)
-                if requested != verified:
+                # Model wording cannot overwrite user-owned wishes. Use their extracted
+                # text even when the model paraphrases it; hard conditions must agree.
+                if replace(requested, preferences=verified.preferences) != verified:
                     return {"error": "Аргументы меняют услуги или условия без выбора пользователя. Используйте текущее состояние запроса."}
+                if requested.preferences and not verified.preferences:
+                    return {"error": "Пожелание не подтверждено сообщением пользователя. Уточните, какие особенности подрядчика нужны."}
             except (ValueError, TypeError, KeyError):
                 return {"error": "Укажите корректные аргументы текущего запроса, не подменяя услуги."}
             result = service.search(verified)
@@ -430,6 +493,39 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
         messages.append({"type": "function_call_output", "call_id": call_id, "output": serialized}
                         if config.provider == "openai" else
                         {"role": "tool", "tool_call_id": call_id, "content": serialized})
+
+    if selection_check and state.get("selected_contractor"):
+        # Apply every user edit before inspecting the selected profile. This path
+        # never replaces the user's selection with a different recommendation.
+        profile = execute("get_contractor", json.dumps({"contractor_id": state["selected_contractor"]}))
+        if "error" in profile:
+            answer = "Выбранный профиль не найден в каталоге. Уточните имя подрядчика."
+        else:
+            price = f"{profile['price_from_kzt']:,}".replace(",", " ")
+            answer = f"Выбран «{profile['name']}». Город: {profile['city']}. Цена от {price} ₸. "
+            budget = state["conditions"].get("budget")
+            if budget is not None and profile["price_from_kzt"] > budget:
+                gap = f"{profile['price_from_kzt'] - budget:,}".replace(",", " ")
+                ceiling = f"{budget:,}".replace(",", " ")
+                answer += f"При бюджете {ceiling} ₸ он не подходит: начальная цена превышает бюджет на {gap} ₸. "
+            elif profile["mismatches"]:
+                answer += "Не подходит по обновлённым условиям. "
+            elif profile["all_conditions_known"]:
+                answer += "По условиям каталога подходит. "
+            else:
+                answer += "Для полной проверки нужно уточнить оставшиеся условия. "
+            other = [reason for reason in profile["mismatches"] if reason != "дороже бюджета"]
+            if other:
+                answer += "Несовпадения: " + "; ".join(other) + ". "
+            if profile.get("price_imputed"):
+                answer += "Цена заполнена при подготовке датасета. "
+            if profile.get("city_imputed"):
+                answer += "Город заполнен при подготовке датасета. "
+            if profile.get("synthetic"):
+                answer += "Синтетический профиль. "
+            answer += "Выбор сохранён; другого подрядчика автоматически не выбираю."
+        return AssistantTurn(answer, [*messages, {"role": "assistant", "content": answer}],
+                             [{"name": "get_contractor", "result": profile}], deepcopy(state))
 
     # A complete explicit request already authorizes search, regardless of model wording.
     ready = search_arguments(state)
@@ -500,9 +596,23 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
             call_count += len(calls)
             if call_count > MAX_CALLS:
                 raise AssistantError("Слишком много вызовов поиска. Сформулируйте запрос точнее.")
+            repeated_rejection = False
             for call_id, name, arguments in calls:
-                result = execute(name, arguments)
+                try:
+                    signature = json.dumps(json.loads(arguments), ensure_ascii=False, sort_keys=True)
+                except (ValueError, TypeError):
+                    signature = str(arguments)
+                repeated_rejection = repeated_rejection or (name == "search_contractors" and signature in search_call_cache and "error" in search_call_cache[signature])
+                if name == "search_contractors" and signature in search_call_cache:
+                    result = deepcopy(search_call_cache[signature])
+                else:
+                    result = execute(name, arguments)
+                    if name == "search_contractors":
+                        search_call_cache[signature] = deepcopy(result)
                 append_output(call_id, name, result)
+            if repeated_rejection:
+                # All calls in the batch have outputs; future API turns remain valid.
+                return finish(missing_question(state) or fallback_text(outputs, state))
         if state["last_results"]:
             return finish()
         raise AssistantError("Агент не завершил поиск за 4 шага. Уточните условия или используйте форму.")

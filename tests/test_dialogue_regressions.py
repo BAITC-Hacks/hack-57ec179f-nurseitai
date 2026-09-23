@@ -7,7 +7,7 @@ from datetime import date
 from unittest.mock import Mock
 
 from assistant import AssistantConfig, SearchTools, run_turn
-from dialogue import empty_state, prepare_turn, safe_text, state_from_request
+from dialogue import empty_state, prepare_turn, safe_text, state_from_request, question_fields, extract_date_window
 from recommender import Contractor, SearchRequest, recommend
 from test_assistant import openai_reply, nvidia_reply
 
@@ -225,3 +225,143 @@ class DialogueRegressions(unittest.TestCase):
             self.assertEqual(facts["languages"], ", ".join(original.languages))
             self.assertFalse(card["preference_evidence"])
             self.assertIn("пожелание не подтверждено описанием", card["explanation"])
+
+    def test_photographer_month_city_typo_and_freeform_any_preserve_need(self):
+        busy = replace(self.catalog[0], busy_dates=frozenset({"2026-12-01", "2026-12-02"}))
+        service = SearchTools([busy, self.catalog[1]], today=self.today)
+        answer = ("Понял, вам нужен фотограф в Алматы в декабре на ближайшую свободную дату.\n"
+                  "Какой бюджет вам подходит? На каком языке нужен ведущий или общение с подрядчиком? "
+                  "На сколько часов требуется фотограф? Формат мероприятия укажите, пожалуйста, если он есть.")
+        first, _ = self.turn("нужен фотограф в декабре в алмате на ближайщую свободную дату",
+                            response=openai_reply(text=answer), service=service)
+        self.assertEqual(first.state["conditions"]["city"], "Алматы")
+        self.assertEqual(first.state["required_services"], ["Фотограф"])
+        self.assertNotIn("ведущ", first.text.lower())
+        self.assertEqual(set(first.state["pending_fields"]), {"budget", "language", "duration_hours", "event_format"})
+        second, _ = self.turn("не важно", first.state, openai_reply(text="В каком городе?"), service)
+        result = second.state["last_results"][0]
+        self.assertEqual(result["request"]["city"], "Алматы")
+        self.assertEqual(result["request"]["event_date"], "2026-12-03")
+        self.assertEqual([r["id"] for r in result["recommendations"]], ["photo"])
+        self.assertIn("03.12.2026", second.text)
+        self.assertNotIn("В каком городе", second.text)
+        self.assertEqual(second.state["date_window"], {"start": "2026-12-01", "end": "2026-12-31", "mode": "earliest"})
+        for field in ("budget", "language", "duration_hours", "event_format"):
+            self.assertIsNone(result["request"][field])
+        third, _ = self.turn("Найди", second.state, openai_reply(text="Нашёл для вас ведущего."), service)
+        self.assertNotIn("ведущ", third.text.lower())
+        self.assertIn("Подобрано", third.text)
+
+    def test_recap_and_candidate_word_do_not_turn_into_date_questions(self):
+        question = ("Понял: город Алматы, ближайшая дата в декабре. "
+                    "Какой бюджет кандидата? Какой язык общения нужен? На сколько часов?")
+        self.assertEqual(question_fields(question), ["budget", "language", "duration_hours"])
+        state = state_from_request(self.request)
+        for field in ("budget", "language", "duration_hours"):
+            state["conditions"].pop(field)
+        first, _ = self.turn("Нужен фотограф", state, openai_reply(text=question))
+        for reply in ("не важно", "Да, мне всё без разницы", "всё остальное не важно", "любой подойдет"):
+            with self.subTest(reply=reply):
+                second, _ = self.turn(reply, first.state)
+                for field in ("city", "event_date", "event_format"):
+                    self.assertEqual(second.state["conditions"][field], state["conditions"][field])
+                for field in ("budget", "language", "duration_hours"):
+                    self.assertIsNone(second.state["conditions"][field])
+
+    def test_month_budget_is_not_mistaken_for_year(self):
+        window = extract_date_window("Нужен фотограф в декабре, бюджет 2000 тенге", self.today)
+        self.assertEqual(window["start"], "2026-12-01")
+        explicit = extract_date_window("в декабре 2027 года, бюджет 2000 тенге", self.today)
+        self.assertEqual(explicit["start"], "2027-12-01")
+        before = extract_date_window("в 2027 году в декабре", self.today)
+        self.assertEqual(before["start"], "2027-12-01")
+
+    def test_any_day_in_month_keeps_month_and_searches_nearest_available(self):
+        state = state_from_request(self.request)
+        first, _ = self.turn("В декабре", state, openai_reply(text="На какой день в указанном месяце?"))
+        self.assertEqual(first.state["pending_fields"], ["event_date"])
+        second, _ = self.turn("без разницы", first.state)
+        self.assertEqual(second.state["conditions"]["event_date"], "2026-12-01")
+        self.assertEqual(second.state["date_window"]["end"], "2026-12-31")
+
+    def test_month_window_rechecks_budget_without_losing_other_conditions(self):
+        cheap = replace(self.catalog[0], busy_dates=frozenset({"2026-12-01", "2026-12-02"}))
+        dear = replace(self.catalog[0], id="dear", price=300_000)
+        service = SearchTools([cheap, dear], today=self.today)
+        first, _ = self.turn("В декабре на ближайшую свободную дату", state_from_request(self.request), service=service)
+        self.assertEqual(first.state["conditions"]["event_date"], "2026-12-03")
+        second, _ = self.turn("Бюджет до 400 тысяч", first.state, service=service)
+        self.assertEqual(second.state["conditions"]["event_date"], "2026-12-01")
+        self.assertEqual(second.state["date_window"], first.state["date_window"])
+        self.assertEqual([r["id"] for r in second.state["last_results"][0]["recommendations"]], ["dear"])
+        for field in ("city", "event_format", "language", "duration_hours"):
+            self.assertEqual(second.state["conditions"][field], first.state["conditions"][field])
+        third, _ = self.turn("На 10 декабря", second.state, service=service)
+        self.assertIsNone(third.state["date_window"])
+        self.assertEqual(third.state["conditions"]["event_date"], "2026-12-10")
+
+    def test_earliest_date_applies_all_constraints_and_service_and(self):
+        combined = replace(self.catalog[2], busy_dates=frozenset({"2026-12-01"}))
+        wrong_format = replace(combined, id="wrong-format", event_formats=("корпоратив",), busy_dates=frozenset())
+        wrong_city = replace(combined, id="wrong-city", city="Астана", busy_dates=frozenset())
+        wrong_language = replace(combined, id="wrong-language", languages=("казахский",), busy_dates=frozenset())
+        short = replace(combined, id="short", max_hours=2, busy_dates=frozenset())
+        service = SearchTools([self.catalog[0], combined, wrong_format, wrong_city, wrong_language, short], today=self.today)
+        state = state_from_request({**self.request, "required_categories": ["Фотограф", "Видеограф"]})
+        turn, _ = self.turn("В декабре на ближайшую свободную дату", state, service=service)
+        result = turn.state["last_results"][0]
+        self.assertEqual(result["request"]["event_date"], "2026-12-02")
+        self.assertEqual([r["id"] for r in result["recommendations"]], ["both"])
+
+    def test_no_free_date_in_month_does_not_search_outside_window(self):
+        busy = replace(self.catalog[0], busy_dates=frozenset(f"2026-12-{day:02d}" for day in range(1, 32)))
+        service = SearchTools([busy], today=self.today)
+        turn, client = self.turn("В декабре на ближайшую свободную дату", state_from_request(self.request), service=service)
+        self.assertFalse(turn.state["last_results"])
+        self.assertNotIn("event_date", turn.state["conditions"])
+        self.assertEqual(turn.state["date_window"]["end"], "2026-12-31")
+        self.assertIn("подходящих подрядчиков нет", turn.text)
+        client.responses.create.assert_not_called()
+
+    def test_outside_catalog_month_is_reported_before_remaining_questions(self):
+        for text in ("Фотограф в Алматы в декабре 2027 на ближайшую свободную дату",
+                     "Фотограф в Алматы в сентябре на ближайшую свободную дату"):
+            turn, client = self.turn(text)
+            self.assertIn("31.12.2026", turn.text)
+            self.assertEqual(turn.text.count("?"), 1)
+            self.assertNotIn("бюджет", turn.text)
+            self.assertFalse(turn.state["last_results"])
+            client.responses.create.assert_not_called()
+        self.assertEqual(extract_date_window("в декабре", date(2026, 12, 23))["start"], "2026-12-01")
+        self.assertEqual(extract_date_window("в декабре", date(2027, 1, 2))["start"], "2027-12-01")
+
+    def test_current_month_earliest_date_never_uses_past_days(self):
+        service = SearchTools([self.catalog[0]], today=date(2026, 12, 23))
+        turn, _ = self.turn("В декабре на ближайшую свободную дату", state_from_request(self.request), service=service)
+        self.assertEqual(turn.state["last_results"][0]["request"]["event_date"], "2026-12-23")
+
+    def test_changing_only_month_preserves_earliest_strategy(self):
+        first, _ = self.turn("В декабре на ближайшую свободную дату", state_from_request(self.request))
+        second, _ = self.turn("В ноябре", first.state)
+        self.assertEqual(second.state["date_window"], {"start": "2026-11-01", "end": "2026-11-30", "mode": "earliest"})
+        self.assertEqual(second.state["last_results"][0]["request"]["event_date"], "2026-11-01")
+        for field in ("city", "event_format", "budget", "language", "duration_hours"):
+            self.assertEqual(second.state["conditions"][field], first.state["conditions"][field])
+
+    def test_legacy_history_recovers_only_questions_actually_asked(self):
+        client = Mock()
+        client.responses.create.return_value = openai_reply(text="На какую дату?")
+        history = [{"role": "user", "content": "Нужен фотограф в Алмате"},
+                   {"role": "assistant", "content": "Какой бюджет вам подходит?"}]
+        turn = run_turn(self.config, self.catalog, "мне не важно", history, client=client, search_tools=self.service)
+        self.assertEqual(turn.state["conditions"], {"city": "Алматы", "budget": None})
+
+    def test_bare_number_answers_only_the_pending_numeric_question(self):
+        for field, reply, expected in (("budget", "250 000", 250_000), ("duration_hours", "4", 4)):
+            state = state_from_request(self.request)
+            state["conditions"].pop(field)
+            state["pending_fields"] = [field]
+            turn, _ = self.turn(reply, state)
+            self.assertEqual(turn.state["conditions"][field], expected)
+            for other in ("city", "event_date", "event_format"):
+                self.assertEqual(turn.state["conditions"][other], state["conditions"][other])

@@ -29,6 +29,8 @@ class Contractor:
     max_hours: int | None
     busy_dates: frozenset[str]
     description: str
+    price_imputed: bool = False
+    city_imputed: bool = False
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,8 @@ def load_contractors(path: str | Path) -> list[Contractor]:
                     max_hours=int(row["max_hours"]) if row["max_hours"].strip() else None,
                     busy_dates=frozenset(_split(row["busy_dates"])),
                     description=row["description"].strip(),
+                    price_imputed=(row.get("price_imputed") or "").strip().casefold() == "true",
+                    city_imputed=(row.get("city_imputed") or "").strip().casefold() == "true",
                 )
             )
     return contractors
@@ -307,16 +311,28 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
     selected = tuple(cards[:limit])
     pipeline.append((f"TOP-{len(selected)}" if limit is not None else "Подходят", len(selected)))
     suggestions = _alternatives(catalog, request, related_categories or {}) if suggest_alternatives else ()
+    location = f"В городе {request.city}" if request.city else "В каталоге"
+    rejected_count = len(pool) - len(eligible)
     if not pool:
-        status, message = "category_absent", f"В выбранном городе ({request.city or 'любой'}) нет подрядчиков со всеми услугами: {category_label}."
+        status, message = "category_absent", f"{location} нет подрядчиков со всеми услугами: {category_label}."
     elif not eligible:
         status = "conditions_not_met"
-        message = (f"В каталоге города {request.city} есть профили категории «{request.category}»: {len(pool)}. "
+        message = (f"{location} по услугам «{category_label}» всего профилей: {len(pool)}. "
                    f"По заданным условиям подходящих нет" +
                    (f" на {request.event_date:%d.%m.%Y}." if request.event_date else "."))
     else:
         status = "matched"
         message = f"Подобрано {min(3, len(selected))} из {len(eligible)} подходящих подрядчиков."
+        if len(eligible) < 3:
+            message += f" {location} по услугам «{category_label}» всего профилей: {len(pool)}."
+            if len(pool) < 3:
+                message += " В этой категории изначально меньше трёх профилей."
+    if pool and len(eligible) < 3 and rejected_count:
+        message += f" По обязательным условиям исключено профилей: {rejected_count}."
+        if counts:
+            message += " Причины: " + "; ".join(f"{name}: {count}" for name, count in counts.items()) + "."
+            if sum(counts.values()) > rejected_count:
+                message += " У одного профиля может быть несколько причин."
     clarification = ""
     if not eligible:
         if len(requested_categories(request)) > 1:
@@ -327,8 +343,6 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
             clarification = "Какое условие готовы изменить? Можно выбрать проверенный вариант ниже или уточнить запрос сообщением."
         else:
             clarification = "По этому запросу вариантов нет. Какую именно задачу должен решить подрядчик и какое условие можно изменить?"
-    if counts and not eligible:
-        message += " Причины отсева: " + "; ".join(f"{name}: {count}" for name, count in counts.items()) + ". Причины могут пересекаться."
     return SearchResult(status=status, message=message, recommendations=selected,
                         rejection_counts=tuple(counts.items()), suggestions=suggestions,
                         pipeline=tuple(pipeline), near_matches=near, matched_count=len(eligible),

@@ -66,7 +66,7 @@ class AssistantTests(unittest.TestCase):
         self.assertIsNone(result["request"]["duration_hours"])
         self.assertEqual(result["matched_count"], 4)
         self.assertEqual({r["name"] for r in result["recommendations"]},
-                         {"Мицури Канроджи", "Эмилия", "Сон Гоку", "Софи Хаттер"})
+                         {"Мицури Канроджи", "Эмилия", "Сон Гоку"})
         self.assertNotIn("дороже бюджета", result["rejection_counts"])
         self.assertFalse(result["suggestions"])
         self.assertTrue(all("бюджет не ограничен" in r["explanation"] for r in result["recommendations"]))

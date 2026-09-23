@@ -32,12 +32,12 @@ class AppTests(unittest.TestCase):
             app.chat_input(key="ai_message").set_value("Нужен ведущий на свадьбу сегодня в Алматы").run()
             self.assertFalse(app.exception)
             names = [item.value for item in app.subheader]
-            for name in ("Мицури Канроджи", "Эмилия", "Сон Гоку", "Софи Хаттер"):
+            for name in ("Мицури Канроджи", "Эмилия", "Сон Гоку"):
                 self.assertEqual(names.count(name), 1)
             self.assertEqual([h.value for h in app.header].count("Ваше мероприятие"), 1)
             self.assertTrue(app.checkbox(key="budget_unlimited").value)
             self.assertIsNone(app.session_state["search_request"].budget)
-            self.assertTrue(any(e.label == "Все подходящие — ещё 1" for e in app.expander))
+            self.assertFalse(any(e.label.startswith("Все подходящие") for e in app.expander))
             app.button(key="manual_submit").click().run()
             self.assertFalse(app.exception)
             self.assertIsNone(app.session_state["search_request"].budget)

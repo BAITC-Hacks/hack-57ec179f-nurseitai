@@ -23,7 +23,7 @@ def render_result(payload, on_request, debug=False):
         st.info(payload["clarification"])
     if payload.get("ranking_mode") == "fallback":
         st.caption(payload["ranking_notice"])
-    cards = payload["recommendations"]
+    cards = payload["recommendations"][:3]
     if cards:
         st.caption("Match — доля подтверждённых условий, не оценка качества. Пожелания подтверждаются цитатами из профиля.")
 
@@ -31,7 +31,12 @@ def render_result(payload, on_request, debug=False):
         with st.container(border=True):
             st.subheader(rec["name"])
             st.caption(rec["id"] + (" · Синтетический профиль" if rec["synthetic"] else ""))
+            st.caption("Город: " + (rec.get("city") or request.get("city") or "Не указан"))
+            if rec.get("city_imputed"):
+                st.caption("Город заполнен при подготовке датасета")
             st.metric("Цена от", f"{rec['price_from_kzt']:,} ₸".replace(",", " "))
+            if rec.get("price_imputed"):
+                st.caption("Цена заполнена при подготовке датасета")
             st.progress(rec["match_percent"] / 100, text=f"Match {rec['match_percent']}% · подтверждено")
             st.write(" · ".join("✓ " + value for value in rec["checks"] if value not in ("Город", "Категория")))
             st.write("**Особенность профиля**")
@@ -64,10 +69,6 @@ def render_result(payload, on_request, debug=False):
         for column, rec in zip(columns, cards[:3]):
             with column:
                 card(rec)
-        if len(cards) > 3:
-            with st.expander(f"Все подходящие — ещё {len(cards) - 3}"):
-                for rec in cards[3:]:
-                    card(rec)
         if len(cards) > 1:
             st.button("Сравнить этих подрядчиков", key=f"compare_button_{key}",
                       on_click=lambda: st.session_state.update({f"compare_{key}": True}))

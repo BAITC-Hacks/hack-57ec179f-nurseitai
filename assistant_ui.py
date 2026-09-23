@@ -4,7 +4,7 @@ from datetime import date
 import streamlit as st
 
 from assistant import CHAT_VERSION, AssistantConfig, AssistantError, run_turn
-from dialogue import empty_state, safe_text
+from dialogue import empty_state, safe_text, search_arguments
 
 
 def describe_request(request):
@@ -62,6 +62,9 @@ def render_assistant(contractors, service, on_result, provider, settings, debug=
             session["history"] = turn.history
             if turn.state is not None:
                 session["state"] = turn.state
+                updated_conditions = search_arguments(turn.state)
+                if updated_conditions is not None:
+                    st.session_state.pending_form = updated_conditions
                 st.session_state.pop("active_result", None)
                 st.session_state.pop("separate_results", None)
             session["display"].extend([
