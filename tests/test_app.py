@@ -53,19 +53,31 @@ class AppTests(unittest.TestCase):
 
     def test_date_suggestion_requires_click_and_preserves_conditions(self):
         app = self.app().run()
-        app.date_input(key="event_date").set_value(date(2026, 10, 3))
+        app.session_state["event_date_picker_0"] = {"value": "2026-10-03", "error": None}
         app.text_area(key="preferences").set_value("квантовый реактор на Марсе")
         app.button(key="manual_submit").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(app.date_input(key="event_date").value, date(2026, 10, 3))
+        self.assertEqual(app.session_state["event_date"], date(2026, 10, 3))
         self.assertIn("04.10.2026", app.button(key="suggestion_0").label)
         app.button(key="suggestion_0").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(app.date_input(key="event_date").value, date(2026, 10, 4))
+        self.assertEqual(app.session_state["event_date"], date(2026, 10, 4))
         self.assertEqual(app.number_input(key="budget").value, 1_500_000)
         self.assertEqual(app.text_area(key="preferences").value, "квантовый реактор на Марсе")
         self.assertEqual(app.session_state["active_result"]["matched_count"], 2)
         self.assertTrue(any("пожелание не подтверждено" in info.value for info in app.info))
+
+    def test_invalid_calendar_input_does_not_search_previous_date(self):
+        app = self.app().run()
+        app.session_state["event_date_picker_0"] = {"value": "2026-11-31", "error": None}
+        app.button(key="manual_submit").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(app.error)
+        self.assertNotIn("active_result", app.session_state)
+        app.checkbox(key="date_unlimited").check()
+        app.button(key="manual_submit").click().run()
+        self.assertFalse(app.exception)
+        self.assertIsNone(app.session_state["active_result"]["request"]["event_date"])
 
     def test_comparison_shortlist_and_history(self):
         app = self.app().run()

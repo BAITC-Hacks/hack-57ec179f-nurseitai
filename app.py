@@ -12,6 +12,7 @@ from recommender import CALENDAR_END, SearchRequest, load_contractors
 from results_ui import render_result
 from semantic import EmbeddingRanker
 from dialogue import state_from_request
+from date_picker import russian_date_input
 
 
 ROOT = Path(__file__).parent
@@ -122,7 +123,8 @@ with st.expander("Ручная настройка", expanded=False):
         with left:
             city = st.selectbox("Город", [None, *sorted({c.city for c in contractors})], key="city", format_func=lambda v: v or "Любой город")
             date_unlimited = st.checkbox("Любая дата — без проверки занятости", key="date_unlimited")
-            event_date = st.date_input("Дата мероприятия", min_value=date(2026, 9, 23), max_value=CALENDAR_END, key="event_date")
+            event_date = russian_date_input("Дата мероприятия", min_value=date(2026, 9, 23),
+                                            max_value=CALENDAR_END, key="event_date", reset=bool(pending))
             category = st.selectbox("Категория", sorted({v for c in contractors for v in c.categories}), key="category")
             additional_categories = st.multiselect("Дополнительные услуги у того же подрядчика", sorted({v for c in contractors for v in c.categories}), key="additional_categories")
         with middle:
@@ -137,6 +139,9 @@ with st.expander("Ручная настройка", expanded=False):
         preferences = st.text_area("Пожелания", key="preferences")
         submitted = st.form_submit_button("Обновить подбор", key="manual_submit", type="primary")
     if submitted:
+        if not date_unlimited and event_date is None:
+            st.error("Укажите существующую дату в формате ДД.ММ.ГГГГ в пределах календаря.")
+            st.stop()
         categories = tuple(dict.fromkeys([category, *additional_categories])) if additional_categories else ()
         request = SearchRequest(city, None if date_unlimited else event_date, event_format, category, None if unlimited else int(budget),
                                 None if duration == "Неважно" else int(duration), "/".join(languages) or None, preferences, categories)

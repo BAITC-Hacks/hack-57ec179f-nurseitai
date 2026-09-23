@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { color-scheme: light; --bg: #fff; --surface: #f0f2f6; --text: #31333f; --primary: #ff4b4b; --border: #aeb0b6; --muted: #666; --font: sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0 1px 2px; background: var(--bg); color: var(--text); font: 14px var(--font); }
+    button, input, select { font: inherit; color: inherit; }
+    button, select { cursor: pointer; }
+    button:disabled, select:disabled, input:disabled { cursor: not-allowed; opacity: .45; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+    label { display: block; margin-bottom: 7px; line-height: 20px; }
+    .field { display: flex; border: 1px solid transparent; border-radius: 8px; background: var(--surface); }
+    .field:focus-within { border-color: var(--primary); }
+    input { width: 100%; min-width: 0; height: 40px; border: 0; border-radius: 8px; background: transparent; padding: 8px 12px; outline: none; font-size: 16px; }
+    input::placeholder { color: var(--muted); opacity: 1; }
+    .toggle { flex: 0 0 42px; padding: 6px; border: 0; border-radius: 7px; background: transparent; }
+    .toggle svg { width: 20px; height: 20px; vertical-align: middle; }
+    .error { min-height: 20px; margin: 4px 0 0; color: var(--text); font-size: 12px; line-height: 16px; }
+    .error:not(:empty)::before { content: "⚠ "; }
+    .calendar { margin-top: 2px; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
+    [hidden] { display: none !important; }
+    .navigation { display: flex; align-items: center; gap: 5px; margin-bottom: 10px; }
+    .navigation select { min-width: 0; height: 34px; padding: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+    #month { flex: 1 1 auto; }
+    #year { flex: 0 1 78px; }
+    .arrow { flex: 0 0 28px; height: 34px; border: 0; background: transparent; border-radius: 5px; font-size: 22px; }
+    .weekdays, .days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px; }
+    .weekdays { margin-bottom: 5px; color: var(--muted); text-align: center; line-height: 25px; font-size: 12px; }
+    .day { min-width: 0; min-height: 33px; border: 1px solid transparent; border-radius: 6px; background: transparent; padding: 4px 0; }
+    .day:not(:disabled):hover, .arrow:not(:disabled):hover { background: var(--surface); }
+    .day[aria-current="date"] { border-color: var(--border); }
+    .day[aria-pressed="true"] { background: var(--primary); color: var(--on-primary, white); font-weight: 700; }
+    .day[aria-pressed="true"]:hover { background: var(--primary); }
+    .hint { margin: 9px 0 0; color: var(--muted); font-size: 11px; line-height: 16px; }
+    @media (max-width: 270px) { .calendar { padding: 7px; } .navigation { gap: 2px; } .arrow { flex-basis: 22px; } #year { flex-basis: 66px; } }
+  </style>
+</head>
+<body>
+  <label id="date-label" for="date-input">Дата мероприятия</label>
+  <div class="field">
+    <input id="date-input" type="text" inputmode="numeric" autocomplete="off" placeholder="ДД.ММ.ГГГГ" maxlength="10" aria-describedby="date-error" aria-controls="calendar" aria-expanded="false">
+    <button id="toggle" class="toggle" type="button" aria-label="Открыть календарь" aria-controls="calendar" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 10h18"/></svg>
+    </button>
+  </div>
+  <p id="date-error" class="error" role="status" aria-live="polite"></p>
+  <section id="calendar" class="calendar" aria-label="Календарь" hidden>
+    <div class="navigation">
+      <button id="previous" class="arrow" type="button" aria-label="Предыдущий месяц">‹</button>
+      <select id="month" aria-label="Месяц"></select>
+      <select id="year" aria-label="Год"></select>
+      <button id="next" class="arrow" type="button" aria-label="Следующий месяц">›</button>
+    </div>
+    <div class="weekdays" aria-hidden="true"><span>Пн</span><span>Вт</span><span>Ср</span><span>Чт</span><span>Пт</span><span>Сб</span><span>Вс</span></div>
+    <div id="days" class="days" role="group" aria-label="Дни месяца"></div>
+    <p class="hint">Выберите день или введите дату в формате ДД.ММ.ГГГГ.</p>
+  </section>
+  <script>
+    "use strict";
+    const MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+    const MONTHS_GENITIVE = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+    const input = document.getElementById("date-input");
+    const toggle = document.getElementById("toggle");
+    const calendar = document.getElementById("calendar");
+    const error = document.getElementById("date-error");
+    const monthSelect = document.getElementById("month");
+    const yearSelect = document.getElementById("year");
+    const days = document.getElementById("days");
+    const previous = document.getElementById("previous");
+    const next = document.getElementById("next");
+    let minDate, maxDate, selected = null, shownYear, shownMonth;
+    let initialized = false, revision, disabled = false, skipFocusOpen = false;
+    let lastSent = null, lastHeight = 0;
+
+    function send(type, fields = {}) {
+      window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:" + type, ...fields}, "*");
+    }
+    function resize() {
+      requestAnimationFrame(() => {
+        const height = Math.max(90, Math.ceil(document.body.getBoundingClientRect().height));
+        if (height !== lastHeight) {
+          lastHeight = height;
+          send("setFrameHeight", {height});
+        }
+      });
+    }
+    function localDate(year, month, day) {
+      const value = new Date(2000, 0, 1, 12);
+      value.setFullYear(year, month - 1, day);
+      return value.getFullYear() === year && value.getMonth() === month - 1 && value.getDate() === day ? value : null;
+    }
+    function parseISO(value) {
+      const parts = typeof value === "string" && /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+      return parts ? localDate(Number(parts[1]), Number(parts[2]), Number(parts[3])) : null;
+    }
+    function iso(value) {
+      return String(value.getFullYear()).padStart(4, "0") + "-" + String(value.getMonth() + 1).padStart(2, "0") + "-" + String(value.getDate()).padStart(2, "0");
+    }
+    function display(value) {
+      return String(value.getDate()).padStart(2, "0") + "." + String(value.getMonth() + 1).padStart(2, "0") + "." + String(value.getFullYear()).padStart(4, "0");
+    }
+    function inRange(value) { return value >= minDate && value <= maxDate; }
+    function clamp(value) { return value < minDate ? minDate : value > maxDate ? maxDate : value; }
+    function emit(value, message) {
+      const payload = {value: value ? iso(value) : null, error: message || null};
+      const signature = JSON.stringify(payload);
+      if (signature !== lastSent) {
+        lastSent = signature;
+        send("setComponentValue", {value: payload, dataType: "json"});
+      }
+    }
+    function setError(message) {
+      error.textContent = message || "";
+      input.setAttribute("aria-invalid", message ? "true" : "false");
+      resize();
+    }
+    function validate() {
+      if (!initialized) return null;
+      const text = input.value.trim();
+      const parts = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec(text);
+      let value = parts ? localDate(Number(parts[3]), Number(parts[2]), Number(parts[1])) : null;
+      let message = !text ? "Укажите дату мероприятия." : !parts ? "Введите дату в формате ДД.ММ.ГГГГ." : !value ? "Такой даты не существует. Проверьте день и месяц." : null;
+      if (value && !inRange(value)) {
+        message = "Выберите дату с " + display(minDate) + " по " + display(maxDate) + ".";
+        value = null;
+      }
+      selected = value;
+      if (value) { shownYear = value.getFullYear(); shownMonth = value.getMonth(); }
+      setError(message);
+      renderCalendar();
+      emit(value, message);
+      return value;
+    }
+    function setOpen(open) {
+      if (disabled) open = false;
+      calendar.hidden = !open;
+      input.setAttribute("aria-expanded", String(open));
+      toggle.setAttribute("aria-expanded", String(open));
+      toggle.setAttribute("aria-label", open ? "Закрыть календарь" : "Открыть календарь");
+      if (open) renderCalendar();
+      resize();
+    }
+    function focusInput() {
+      skipFocusOpen = true;
+      input.focus({preventScroll: true});
+      skipFocusOpen = false;
+    }
+    function choose(value) {
+      selected = value;
+      input.value = display(value);
+      setError(null);
+      emit(value, null);
+      setOpen(false);
+      focusInput();
+    }
+    function monthAllowed(year, month) {
+      const start = localDate(year, month + 1, 1);
+      const end = new Date(year, month + 1, 0, 12);
+      return start <= maxDate && end >= minDate;
+    }
+    function renderCalendar(focusDate = null) {
+      if (!initialized) return;
+      monthSelect.replaceChildren();
+      MONTHS.forEach((name, month) => {
+        const option = new Option(name, String(month));
+        option.disabled = !monthAllowed(shownYear, month);
+        monthSelect.add(option);
+      });
+      monthSelect.value = String(shownMonth);
+      yearSelect.replaceChildren();
+      for (let year = minDate.getFullYear(); year <= maxDate.getFullYear(); year++) yearSelect.add(new Option(String(year), String(year)));
+      yearSelect.value = String(shownYear);
+      const first = localDate(shownYear, shownMonth + 1, 1);
+      const prev = new Date(shownYear, shownMonth - 1, 1, 12);
+      const after = new Date(shownYear, shownMonth + 1, 1, 12);
+      previous.disabled = !monthAllowed(prev.getFullYear(), prev.getMonth());
+      next.disabled = !monthAllowed(after.getFullYear(), after.getMonth());
+      days.setAttribute("aria-label", MONTHS[shownMonth] + " " + shownYear);
+      days.replaceChildren();
+      const offset = (first.getDay() + 6) % 7;
+      for (let index = 0; index < offset; index++) {
+        const blank = document.createElement("span");
+        blank.setAttribute("aria-hidden", "true");
+        days.append(blank);
+      }
+      const count = new Date(shownYear, shownMonth + 1, 0, 12).getDate();
+      const today = iso(new Date());
+      for (let day = 1; day <= count; day++) {
+        const value = localDate(shownYear, shownMonth + 1, day);
+        const key = iso(value);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "day";
+        button.textContent = String(day);
+        button.dataset.date = key;
+        button.disabled = !inRange(value);
+        button.setAttribute("aria-label", day + " " + MONTHS_GENITIVE[shownMonth] + " " + shownYear);
+        button.setAttribute("aria-pressed", String(Boolean(selected && key === iso(selected))));
+        if (key === today) button.setAttribute("aria-current", "date");
+        button.addEventListener("click", () => choose(value));
+        button.addEventListener("keydown", event => {
+          const moves = {ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7};
+          if (!(event.key in moves)) return;
+          event.preventDefault();
+          const target = new Date(value);
+          target.setDate(target.getDate() + moves[event.key]);
+          if (!inRange(target)) return;
+          shownYear = target.getFullYear();
+          shownMonth = target.getMonth();
+          renderCalendar(iso(target));
+        });
+        days.append(button);
+      }
+      if (focusDate) days.querySelector('[data-date="' + focusDate + '"]')?.focus();
+      resize();
+    }
+    function moveMonth(delta) {
+      const value = new Date(shownYear, shownMonth + delta, 1, 12);
+      if (!monthAllowed(value.getFullYear(), value.getMonth())) return;
+      shownYear = value.getFullYear();
+      shownMonth = value.getMonth();
+      renderCalendar();
+    }
+    function setTheme(theme) {
+      const dark = theme.base === "dark";
+      const root = document.documentElement;
+      root.style.colorScheme = dark ? "dark" : "light";
+      const colors = {
+        "--bg": theme.backgroundColor || (dark ? "#0e1117" : "#fff"),
+        "--surface": theme.secondaryBackgroundColor || (dark ? "#262730" : "#f0f2f6"),
+        "--text": theme.textColor || (dark ? "#fafafa" : "#31333f"),
+        "--primary": theme.primaryColor || "#ff4b4b",
+        "--border": dark ? "#646873" : "#aeb0b6",
+        "--muted": dark ? "#b5b8c2" : "#666",
+        "--font": theme.font || "sans-serif"
+      };
+      Object.entries(colors).forEach(([key, value]) => root.style.setProperty(key, value));
+    }
+    window.addEventListener("message", event => {
+      if (event.source !== window.parent || event.data?.type !== "streamlit:render") return;
+      const args = event.data.args || {};
+      setTheme(event.data.theme || {});
+      document.getElementById("date-label").textContent = args.label || "Дата мероприятия";
+      const today = new Date();
+      minDate = parseISO(args.min_date) || localDate(today.getFullYear() - 10, 1, 1);
+      maxDate = parseISO(args.max_date) || localDate(today.getFullYear() + 10, 12, 31);
+      if (maxDate < minDate) maxDate = minDate;
+      disabled = Boolean(args.disabled || event.data.disabled);
+      input.disabled = disabled;
+      toggle.disabled = disabled;
+      const changed = !initialized || revision !== args.revision;
+      if (changed) {
+        revision = args.revision;
+        selected = parseISO(args.value);
+        if (selected && !inRange(selected)) selected = null;
+        input.value = selected ? display(selected) : "";
+        const anchor = clamp(selected || today);
+        shownYear = anchor.getFullYear();
+        shownMonth = anchor.getMonth();
+        lastSent = null;
+        setError(null);
+      }
+      initialized = true;
+      if (disabled) setOpen(false);
+      renderCalendar();
+      resize();
+    });
+    input.addEventListener("input", validate);
+    input.addEventListener("change", validate);
+    input.addEventListener("focus", () => { if (!skipFocusOpen) setOpen(true); });
+    input.addEventListener("keydown", event => {
+      if (event.key === "Enter") { event.preventDefault(); if (validate()) setOpen(false); }
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setOpen(true);
+        (days.querySelector('[aria-pressed="true"]') || days.querySelector("button:not(:disabled)"))?.focus();
+      }
+    });
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !calendar.hidden) {
+        event.preventDefault();
+        setOpen(false);
+        focusInput();
+      }
+    });
+    toggle.addEventListener("click", () => setOpen(calendar.hidden));
+    previous.addEventListener("click", () => moveMonth(-1));
+    next.addEventListener("click", () => moveMonth(1));
+    monthSelect.addEventListener("change", () => { shownMonth = Number(monthSelect.value); renderCalendar(); });
+    yearSelect.addEventListener("change", () => {
+      shownYear = Number(yearSelect.value);
+      const anchor = clamp(localDate(shownYear, shownMonth + 1, 1));
+      shownYear = anchor.getFullYear();
+      shownMonth = anchor.getMonth();
+      renderCalendar();
+    });
+    new ResizeObserver(resize).observe(document.body);
+    window.addEventListener("resize", resize);
+    send("componentReady", {apiVersion: 1});
+    resize();
+  </script>
+</body>
+</html>
