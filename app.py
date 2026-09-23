@@ -60,38 +60,39 @@ def apply_suggestion(request):
         st.session_state[key] = value
 
 
-with st.form("search"):
-    left, middle, right = st.columns(3)
-    with left:
-        city = st.selectbox("Город", cities, key="city")
-        event_date = st.date_input(
-            "Дата мероприятия",
-            min_value=date(2026, 9, 23),
-            max_value=CALENDAR_END,
-            key="event_date",
+with st.expander("Фильтры и поиск — показать / скрыть", expanded=True):
+    with st.form("search"):
+        left, middle, right = st.columns(3)
+        with left:
+            city = st.selectbox("Город", cities, key="city")
+            event_date = st.date_input(
+                "Дата мероприятия",
+                min_value=date(2026, 9, 23),
+                max_value=CALENDAR_END,
+                key="event_date",
+            )
+            category = st.selectbox("Категория", categories, key="category")
+        with middle:
+            event_format = st.selectbox("Формат мероприятия", formats, key="event_format")
+            budget_unlimited = st.checkbox("Без ограничения бюджета", key="budget_unlimited",
+                                           help="При включении цена не ограничивает поиск; сумма ниже не используется.")
+            budget = st.number_input("Бюджет, ₸", min_value=1, step=50_000, key="budget")
+            language_options = ["Неважно", *languages]
+            language = st.selectbox("Язык", language_options, key="language")
+        with right:
+            duration = st.selectbox(
+                "Длительность",
+                ["Неважно", *range(1, 13)],
+                key="duration",
+                format_func=lambda value: value if value == "Неважно" else f"{value} ч",
+            )
+        preferences = st.text_area(
+            "Дополнительные пожелания",
+            key="preferences",
+            placeholder="Например: интеллигентный ведущий для деловой аудитории, без навязчивых конкурсов",
+            help="NLP-модуль сравнит пожелания с описаниями доступных подрядчиков.",
         )
-        category = st.selectbox("Категория", categories, key="category")
-    with middle:
-        event_format = st.selectbox("Формат мероприятия", formats, key="event_format")
-        budget_unlimited = st.checkbox("Без ограничения бюджета", key="budget_unlimited",
-                                       help="При включении цена не ограничивает поиск; сумма ниже не используется.")
-        budget = st.number_input("Бюджет, ₸", min_value=1, step=50_000, key="budget")
-        language_options = ["Неважно", *languages]
-        language = st.selectbox("Язык", language_options, key="language")
-    with right:
-        duration = st.selectbox(
-            "Длительность",
-            ["Неважно", *range(1, 13)],
-            key="duration",
-            format_func=lambda value: value if value == "Неважно" else f"{value} ч",
-        )
-    preferences = st.text_area(
-        "Дополнительные пожелания",
-        key="preferences",
-        placeholder="Например: интеллигентный ведущий для деловой аудитории, без навязчивых конкурсов",
-        help="NLP-модуль сравнит пожелания с описаниями доступных подрядчиков.",
-    )
-    submitted = st.form_submit_button("Подобрать", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Подобрать", type="primary", use_container_width=True)
 
 if submitted:
     request = SearchRequest(
