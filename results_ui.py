@@ -1,9 +1,42 @@
 import re
+from html import escape
 
 import streamlit as st
 
 from assistant_ui import describe_request
 from product import comparison_rows, detailed_reasons, search_id, toggle_shortlist
+
+
+def render_comparison(rows):
+    """Use wrapping HTML cells: the dataframe grid clips long profile text."""
+    if not rows:
+        return
+    cell = lambda value: escape(str(value))
+    headings = "".join(f'<th scope="col">{cell(row["Подрядчик"])}</th>' for row in rows)
+    fields = list(dict.fromkeys(field for row in rows for field in row if field != "Подрядчик"))
+    body = "".join(
+        f'<tr><th scope="row">{cell(field)}</th>' +
+        "".join(f'<td>{cell(row.get(field, "—"))}</td>' for row in rows) + "</tr>"
+        for field in fields
+    )
+    minimum = max(560, 180 + 220 * len(rows)) if len(rows) > 3 else 560
+    st.markdown(
+        '<style>'
+        '.comparison-scroll {width:100%; overflow-x:auto;}'
+        '.contractor-comparison {width:100%; table-layout:fixed; border-collapse:collapse;}'
+        '.contractor-comparison th,.contractor-comparison td {'
+        'white-space:pre-wrap; overflow-wrap:anywhere; word-break:normal;'
+        'vertical-align:top; text-align:left; padding:12px 14px;'
+        'border:1px solid #80808055; line-height:1.55; height:auto;}'
+        '.contractor-comparison th:first-child {width:20%;}'
+        '.contractor-comparison thead th {background:#80808018;}'
+        '</style>'
+        '<div class="comparison-scroll" role="region" aria-label="Сравнение подрядчиков" tabindex="0">'
+        f'<table class="contractor-comparison" style="min-width:{minimum}px">'
+        f'<thead><tr><th scope="col">Критерий</th>{headings}</tr></thead>'
+        f'<tbody>{body}</tbody></table></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_profile_feature(value):
@@ -69,7 +102,7 @@ def render_result(payload, on_request, debug=False):
                       on_click=lambda: st.session_state.update({f"compare_{key}": True}))
             if st.session_state.get(f"compare_{key}"):
                 st.subheader("Сравнение TOP-3")
-                st.dataframe(comparison_rows(cards[:3], request), hide_index=True, use_container_width=True)
+                render_comparison(comparison_rows(cards[:3], request))
     if payload["suggestions"]:
         st.subheader("Что можно изменить")
         for index, suggestion in enumerate(payload["suggestions"]):

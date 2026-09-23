@@ -1,6 +1,7 @@
 import json
 import unittest
 from datetime import date
+from html import escape
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,8 +88,11 @@ class AppTests(unittest.TestCase):
         first = payload["recommendations"][0]
         app.button(key=f"compare_button_{key}").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(len(app.dataframe), 1)
-        self.assertEqual(len(app.dataframe[0].value), 3)
+        tables = [item.value for item in app.markdown
+                  if "<table" in item.value and "contractor-comparison" in item.value]
+        self.assertEqual(len(tables), 1)
+        self.assertTrue(all(escape(card["name"]) in tables[0]
+                            for card in payload["recommendations"][:3]))
         app.button(key=f"save_{key}_{first['id']}").click().run()
         self.assertIn(first["id"], app.session_state["shortlist"])
         self.assertEqual(len(app.session_state["search_history"]), 1)

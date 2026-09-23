@@ -9,7 +9,7 @@ from assistant import AssistantConfig, AssistantError, SearchTools, request_dict
 from assistant_ui import describe_request, render_assistant
 from product import comparison_rows, record_search
 from recommender import CALENDAR_END, SearchRequest, load_contractors
-from results_ui import render_result
+from results_ui import render_result, render_comparison
 from semantic import EmbeddingRanker
 from dialogue import state_from_request
 from date_picker import russian_date_input
@@ -173,4 +173,4 @@ if st.session_state.get("compare_shortlist") and len(shortlist) > 1:
     st.subheader("Сравнение сохранённых вариантов")
     st.caption("Снимки из разных запросов. Даты и условия могут различаться; повторите поиск перед выбором.")
     rows = [comparison_rows([item["contractor"]], item["request"])[0] for item in shortlist.values()]
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    render_comparison(rows)
