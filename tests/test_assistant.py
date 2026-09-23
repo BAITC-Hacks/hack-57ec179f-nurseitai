@@ -163,6 +163,22 @@ class AssistantTests(unittest.TestCase):
         self.assertFalse(turn.tool_results)
         self.assertIn("дату", turn.text)
 
+    def test_clarification_then_any_conditions_search_keeps_dialogue(self):
+        client = Mock()
+        question = "Какой бюджет вам подходит? Какой язык нужен? На сколько часов?"
+        args = dict(city="Алматы", event_date="2026-09-23", event_format="свадьба",
+                    category="Ведущий", budget=None, language=None, duration_hours=None, preferences="")
+        client.responses.create.side_effect = [openai_reply(text=question),
+            openai_reply([("search_contractors", json.dumps(args))]), openai_reply(text="Найдено 4 ведущих")]
+        config = AssistantConfig("openai", "test", "fake")
+        first = run_turn(config, self.contractors, "Нужен ведущий на свадьбу сегодня в Алматы", client=client)
+        self.assertFalse(first.tool_results)
+        second = run_turn(config, self.contractors, "Всё без разницы", first.history, client=client)
+        result = second.tool_results[0]["result"]
+        self.assertEqual(result["matched_count"], 4)
+        self.assertTrue(all(result["request"][field] is None for field in ("budget", "language", "duration_hours")))
+        self.assertIn(question, json.dumps(second.history, ensure_ascii=False))
+
     def test_invalid_arguments_are_returned_to_model_for_correction(self):
         client = Mock()
         client.responses.create.side_effect = [openai_reply([("search_contractors", "{}")] ),
