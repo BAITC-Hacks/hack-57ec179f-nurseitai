@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -9,6 +10,70 @@ DATA_PATH = Path(__file__).parents[1] / "data" / "contractors.csv"
 
 
 class RecommenderTests(unittest.TestCase):
+    def base_request(self, **changes):
+        return replace(SearchRequest("Алматы", date(2026, 10, 14), "свадьба",
+                                     "Ведущий", 1_500_000, 6, "русский"), **changes)
+
+    def test_impossible_preference_has_no_score_or_false_claim(self):
+        result = recommend(self.contractors, self.base_request(preferences="квантовый реактор на Марсе"))
+        for item in result.recommendations:
+            self.assertEqual(dict(item.factors)["Текстовая релевантность"], 0)
+            self.assertIn("Обязательные условия подходят, но пожелание не подтверждено описанием", item.explanation)
+
+    def test_profile_facts_distinguish_equal_conditions_without_names(self):
+        pool = [item for item in self.contractors if item.name in ("Эмилия", "Кики")]
+        self.assertEqual(len(pool), 2)
+        result = recommend(pool, self.base_request())
+        explanations = []
+        for rec in result.recommendations:
+            text = rec.explanation
+            for item in pool:
+                text = text.replace(item.name, "")
+            explanations.append(text)
+            self.assertIn("В профиле указано:", text)
+        self.assertEqual(len(set(explanations)), 2)
+
+    def test_evidence_is_exact_quote_and_partial_wish_is_not_confirmed(self):
+        candidate = replace(self.contractors[0], categories=("Ведущий",),
+                            price=100_000, busy_dates=frozenset(),
+                            description="Тонкий юмор и сдержанные манеры.")
+        positive = recommend([candidate], self.base_request(preferences="тонкий юмор"))
+        self.assertIn("фрагмент по пожеланию: «Тонкий юмор и сдержанные манеры.»", positive.recommendations[0].explanation)
+        negative = recommend([candidate], self.base_request(preferences="тонкий юмор и квантовый реактор"))
+        self.assertIn("пожелание не подтверждено", negative.recommendations[0].explanation)
+
+    def test_next_date_is_verified_without_changing_original_request(self):
+        request = self.base_request(event_date=date(2026, 10, 3))
+        result = recommend(self.contractors, request)
+        suggestion = next(s for s in result.suggestions if s.request.event_date != request.event_date)
+        self.assertEqual(suggestion.request, replace(request, event_date=date(2026, 10, 4)))
+        self.assertEqual(suggestion.count, 2)
+        self.assertEqual(len(recommend(self.contractors, suggestion.request).recommendations), 2)
+        self.assertEqual(request.event_date, date(2026, 10, 3))
+
+    def test_minimum_budget_ignores_cheaper_ineligible_contractors(self):
+        base = replace(self.contractors[0], categories=("Ведущий",), busy_dates=frozenset())
+        pool = [replace(base, id="a", price=200_000, languages=("английский",)),
+                replace(base, id="b", price=350_000), replace(base, id="c", price=450_000)]
+        request = self.base_request(budget=100_000)
+        result = recommend(pool, request)
+        self.assertEqual(len(result.suggestions), 1)
+        suggestion = result.suggestions[0]
+        self.assertEqual(suggestion.request, replace(request, budget=350_000))
+        self.assertEqual(suggestion.count, 1)
+
+    def test_no_alternative_beyond_calendar_or_for_wrong_language(self):
+        base = replace(self.contractors[0], categories=("Ведущий",), price=100_000,
+                       busy_dates=frozenset({"2026-12-31"}))
+        self.assertFalse(recommend([base], self.base_request(event_date=date(2026, 12, 31))).suggestions)
+        self.assertFalse(recommend([replace(base, languages=("английский",))], self.base_request()).suggestions)
+
+    def test_sparse_category_summary_is_visible_in_message(self):
+        result = recommend(self.contractors, self.base_request(category="Флорист"))
+        self.assertEqual(len(result.recommendations), 1)
+        self.assertIn("всего 2", result.message)
+        self.assertIn("заняты: 1", result.message)
+
     @classmethod
     def setUpClass(cls):
         cls.contractors = load_contractors(DATA_PATH)

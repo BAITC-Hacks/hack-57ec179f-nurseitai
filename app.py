@@ -3,7 +3,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from recommender import SearchRequest, load_contractors, recommend
+from recommender import CALENDAR_END, SearchRequest, load_contractors, recommend
 
 
 DATA_PATH = Path(__file__).parent / "data" / "contractors.csv"
@@ -38,32 +38,47 @@ cities = sorted({item.city for item in contractors})
 categories = sorted({value for item in contractors for value in item.categories})
 formats = sorted({value for item in contractors for value in item.event_formats})
 languages = sorted({value for item in contractors for value in item.languages})
+st.session_state.setdefault("event_date", date(2026, 10, 14))
+st.session_state.setdefault("budget", 1_500_000)
+
+
+def apply_suggestion(request):
+    st.session_state.search_request = request
+    for key, value in dict(city=request.city, event_date=request.event_date,
+                           category=request.category, event_format=request.event_format,
+                           budget=request.budget, language=request.language or "Неважно",
+                           duration=request.duration_hours or "Неважно",
+                           preferences=request.preferences).items():
+        st.session_state[key] = value
+
 
 with st.form("search"):
     left, middle, right = st.columns(3)
     with left:
-        city = st.selectbox("Город", cities)
+        city = st.selectbox("Город", cities, key="city")
         event_date = st.date_input(
             "Дата мероприятия",
-            value=date(2026, 10, 14),
             min_value=date(2026, 9, 23),
-            max_value=date(2026, 12, 31),
+            max_value=CALENDAR_END,
+            key="event_date",
         )
-        category = st.selectbox("Категория", categories, index=categories.index("Ведущий"))
+        category = st.selectbox("Категория", categories, index=categories.index("Ведущий"), key="category")
     with middle:
-        event_format = st.selectbox("Формат мероприятия", formats, index=formats.index("свадьба"))
-        budget = st.number_input("Бюджет, ₸", min_value=100_000, value=1_500_000, step=50_000)
+        event_format = st.selectbox("Формат мероприятия", formats, index=formats.index("свадьба"), key="event_format")
+        budget = st.number_input("Бюджет, ₸", min_value=100_000, step=50_000, key="budget")
         language_options = ["Неважно", *languages]
-        language = st.selectbox("Язык", language_options, index=language_options.index("русский"))
+        language = st.selectbox("Язык", language_options, index=language_options.index("русский"), key="language")
     with right:
         duration = st.selectbox(
             "Длительность",
             ["Неважно", *range(1, 13)],
             index=6,
+            key="duration",
             format_func=lambda value: value if value == "Неважно" else f"{value} ч",
         )
     preferences = st.text_area(
         "Дополнительные пожелания",
+        key="preferences",
         placeholder="Например: интеллигентный ведущий для деловой аудитории, без навязчивых конкурсов",
         help="NLP-модуль сравнит пожелания с описаниями доступных подрядчиков.",
     )
@@ -80,6 +95,10 @@ if submitted:
         language=None if language == "Неважно" else language,
         preferences=preferences,
     )
+    st.session_state.search_request = request
+
+if "search_request" in st.session_state:
+    request = st.session_state.search_request
     result = recommend(contractors, request)
 
     if result.status == "matched":
@@ -103,6 +122,14 @@ if submitted:
                         st.write(item.description)
     else:
         st.warning(result.message)
+        for index, suggestion in enumerate(result.suggestions):
+            st.info(suggestion.message)
+            st.button("Применить перенос даты" if suggestion.request.event_date != request.event_date
+                      else "Применить новый бюджет", key=f"suggestion_{index}",
+                      on_click=apply_suggestion, args=(suggestion.request,))
+        if result.status == "conditions_not_met" and not result.suggestions:
+            st.info("Перенос даты вперёд до 31.12.2026 или увеличение только бюджета "
+                    "не дают вариантов. Нужно пересмотреть другие условия.")
 
     if result.rejection_counts:
         with st.expander("Почему другие кандидаты не прошли"):

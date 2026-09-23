@@ -4,8 +4,8 @@ import csv
 import math
 import re
 from collections import Counter
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, replace
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -50,11 +50,39 @@ class Recommendation:
 
 
 @dataclass(frozen=True)
+class Suggestion:
+    request: SearchRequest
+    count: int
+    message: str
+
+
+@dataclass(frozen=True)
 class SearchResult:
     status: str
     message: str
     recommendations: tuple[Recommendation, ...] = ()
     rejection_counts: tuple[tuple[str, int], ...] = ()
+    suggestions: tuple[Suggestion, ...] = ()
+
+
+CALENDAR_END = date(2026, 12, 31)
+
+
+def _fragments(description: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|[\n•]+", description) if part.strip()]
+
+
+def _preference_evidence(preferences: str, description: str) -> str:
+    # Conservative lexical evidence: every meaningful word must occur in one
+    # source fragment. Partial overlap is not confirmation of the whole wish.
+    stopwords = {"для", "на", "и", "с", "в", "по", "хочу", "нужен", "нужна", "чтобы"}
+    words = set(re.findall(r"[а-яёa-z0-9]+", preferences.casefold())) - stopwords
+    if not words:
+        return ""
+    for fragment in _fragments(description):
+        if words <= set(re.findall(r"[а-яёa-z0-9]+", fragment.casefold())):
+            return fragment
+    return ""
 
 
 def load_contractors(path: str | Path) -> list[Contractor]:
@@ -143,11 +171,18 @@ def _score_factors(
     )
 
 
-def _explain(contractor: Contractor, request: SearchRequest, relevance: float) -> str:
+def _explain(contractor: Contractor, request: SearchRequest) -> str:
+    fragments = _fragments(contractor.description)
+    evidence = _preference_evidence(request.preferences, contractor.description)
+    profile_fact = evidence or next(
+        (part for part in fragments if re.search(r"опыт|лет|юмор|манер", part, re.I)),
+        fragments[0] if fragments else "",
+    )
     facts = [
-        f"свободен {request.event_date.strftime('%d.%m.%Y')}",
+        f"В профиле указано: «{profile_fact}»" if profile_fact else "Описание профиля отсутствует",
+        f"свободен по календарю {request.event_date.strftime('%d.%m.%Y')}",
         f"берёт формат «{request.event_format}»",
-        f"цена от {contractor.price:,} ₸ укладывается в бюджет".replace(",", " "),
+        f"цена от {contractor.price:,} ₸ при бюджете {request.budget:,} ₸".replace(",", " "),
     ]
     if request.language:
         facts.append(f"работает на языке «{request.language}»")
@@ -157,15 +192,16 @@ def _explain(contractor: Contractor, request: SearchRequest, relevance: float) -
         else:
             facts.append(f"доступен до {contractor.max_hours} ч")
     if request.preferences.strip():
-        if relevance > 0:
-            facts.append("описание профиля связано с указанными пожеланиями")
+        if evidence:
+            facts.append(f"фрагмент по пожеланию: «{evidence}» (лексическое совпадение, со слов подрядчика)")
         else:
-            facts.append("прямого совпадения с дополнительными пожеланиями не найдено")
-    return "; ".join(facts).capitalize() + "."
+            facts.append("Обязательные условия подходят, но пожелание не подтверждено описанием")
+    return "; ".join(facts) + "."
 
 
 def recommend(
-    contractors: Iterable[Contractor], request: SearchRequest, limit: int = 3
+    contractors: Iterable[Contractor], request: SearchRequest, limit: int = 3,
+    *, suggest_alternatives: bool = True
 ) -> SearchResult:
     pool = [
         item
@@ -212,36 +248,17 @@ def recommend(
             status="conditions_not_met",
             message=f"Кандидаты есть, но никто не прошёл условия. {detail}.",
             rejection_counts=rejection_counts,
+            suggestions=_alternatives(pool, request) if suggest_alternatives else (),
         )
 
-    query_text = " ".join(
-        part
-        for part in (
-            request.category,
-            request.event_format,
-            request.language or "",
-            request.preferences,
-        )
-        if part
-    )
-    documents = [
-        " ".join(
-            [
-                *item.categories,
-                *item.event_formats,
-                *item.languages,
-                item.description,
-            ]
-        )
-        for item in eligible
+    relevance_scores = _text_relevance(request.preferences, [item.description for item in eligible])
+    relevance_scores = [
+        score if _preference_evidence(request.preferences, item.description) else 0.0
+        for item, score in zip(eligible, relevance_scores)
     ]
-    relevance_scores = _text_relevance(query_text, documents)
     factors_by_id = {
         item.id: _score_factors(item, request, relevance)
         for item, relevance in zip(eligible, relevance_scores)
-    }
-    relevance_by_id = {
-        item.id: relevance for item, relevance in zip(eligible, relevance_scores)
     }
 
     def total_score(item: Contractor) -> float:
@@ -255,15 +272,46 @@ def recommend(
         Recommendation(
             item,
             total_score(item),
-            _explain(item, request, relevance_by_id[item.id]),
+            _explain(item, request),
             factors_by_id[item.id],
         )
         for item in ranked[:limit]
     )
     suffix = "" if len(eligible) >= limit else f" Подходящих найдено только {len(eligible)}."
+    detail = "; ".join(f"{name}: {count}" for name, count in rejection_counts)
+    summary = f" В городе {request.city}, категория «{request.category}»: всего {len(pool)}."
+    if detail:
+        summary += f" Не прошли фильтры: {detail}. Причины могут пересекаться."
     return SearchResult(
         status="matched",
-        message=f"Подобрано {len(recommendations)} из {len(eligible)} подходящих подрядчиков.{suffix}",
+        message=f"Подобрано {len(recommendations)} из {len(eligible)} подходящих подрядчиков.{suffix}{summary}",
         recommendations=recommendations,
         rejection_counts=rejection_counts,
     )
+
+
+def _alternatives(pool: list[Contractor], request: SearchRequest) -> tuple[Suggestion, ...]:
+    suggestions = []
+
+    def count_matches(changed: SearchRequest) -> int:
+        result = recommend(pool, changed, limit=len(pool), suggest_alternatives=False)
+        return len(result.recommendations)
+
+    for offset in range(1, (CALENDAR_END - request.event_date).days + 1):
+        changed = replace(request, event_date=request.event_date + timedelta(days=offset))
+        count = count_matches(changed)
+        if count:
+            suggestions.append(Suggestion(changed, count,
+                f"Если перенести мероприятие на {changed.event_date:%d.%m.%Y}, "
+                f"доступно вариантов: {count}. Остальные условия сохранены."))
+            break
+    for price in sorted({item.price for item in pool if item.price > request.budget}):
+        changed = replace(request, budget=price)
+        count = count_matches(changed)
+        if count:
+            suggestions.append(Suggestion(changed, count, (
+                f"Минимальное увеличение бюджета: +{price - request.budget:,} ₸ "
+                f"(до {price:,} ₸). Доступно вариантов: {count}. "
+                "Дата и остальные условия сохранены.").replace(",", " ")))
+            break
+    return tuple(suggestions)
