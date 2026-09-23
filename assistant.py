@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from recommender import CALENDAR_END, Contractor, SearchRequest, recommend, requested_languages, rejection_reasons
+from recommender import CALENDAR_END, Contractor, SearchRequest, recommend, requested_languages, rejection_reasons, category_matches
+from dialogue import empty_state, prepare_turn, search_arguments, safe_text, fallback_text, missing_question, question_fields
 
 
 CALENDAR_START = date(2026, 9, 23)
@@ -16,9 +18,22 @@ ENDPOINTS = {"openai": "https://api.openai.com/v1", "nvidia": "https://integrate
 MAX_ROUNDS = 4
 MAX_CALLS = 8
 MAX_HISTORY_CHARS = 120_000
-CHAT_VERSION = 4
+CHAT_VERSION = 5
 
 SYSTEM_PROMPT = """Ты ИИ-агент по подбору event-подрядчиков для HackAlem AI.
+СНАЧАЛА определи задачу и реальную категорию каталога, затем остальные условия.
+«Другое» — категория не определена. Для неподдерживаемой услуги сообщи об этом сразу
+и задай ОДИН вопрос о задаче специалиста, не опрашивай о мероприятии.
+Фотосъёмка = Фотограф; видеосъёмка (в том числе «видеосъекмка») = Видеограф.
+Обе услуги у одного = required_categories=["Фотограф", "Видеограф"], логика AND.
+Фото и видеобудки — только явно запрошенная фотобудка, фотозеркало или видеобудка.
+Не переходи к двум специалистам без выбора пользователя. Не изобретай категории.
+Состояние мероприятия из системного контекста приоритетнее старых ответов модели.
+Просмотр профиля не меняет услуги, условия, выбор или результаты поиска.
+Если формат не указан, говори «формат не заявлен в каталоге», а не «отказывается».
+Никогда не спрашивай разрешение на поиск: известны условия — ищи сразу.
+Явное изменение условия пользователем уже является выбором. Остальные поля сохраняй.
+Возвращай обычный текст, никогда JSON, аргументы функций или технические объекты.
 Отвечай на языке пользователя. Помогай собрать условия мероприятия.
 Цены, профили, доступность, причины отказа и альтернативы узнавай ТОЛЬКО через функции.
 Если не хватает города, категории, даты или формата, уточни их.
@@ -114,15 +129,19 @@ def _object(properties: dict) -> dict:
 
 
 SEARCH_PARAMETERS = _object({
-    "city": {"type": "string", "description": "Город из get_search_options."},
-    "event_date": {"type": "string", "description": "Дата YYYY-MM-DD. Сегодня/завтра — от текущей даты системного контекста."},
-    "event_format": {"type": "string"},
+    "city": {"type": ["string", "null"], "description": "Город из get_search_options, null только если явно любой."},
+    "event_date": {"type": ["string", "null"], "description": "Дата YYYY-MM-DD, null если явно любая. Сегодня/завтра — от текущей даты системного контекста."},
+    "event_format": {"type": ["string", "null"]},
     "category": {"type": "string"},
     "budget": {"type": ["integer", "null"], "description": "Максимальная цена в тенге, ТОЛЬКО если пользователь её задал. Иначе null — любой бюджет. Не подставляй 100000."},
     "duration_hours": {"type": ["integer", "null"], "description": "От 1 до 12 часов, null если неважно."},
     "language": {"type": ["string", "null"]},
     "preferences": {"type": "string", "description": "Только дополнительные пожелания, без обязательных условий."},
 })
+# Backward-compatible Python requests may omit this field; strict tool calls include it.
+SEARCH_PARAMETERS["properties"]["required_categories"] = {"type": "array", "items": {"type": "string"},
+    "description": "Все требуемые услуги у ОДНОГО подрядчика (AND). Для одной услуги — пустой массив."}
+SEARCH_PARAMETERS["required"].append("required_categories")
 TOOLS = [
     {"type": "function", "name": "get_search_options", "strict": True,
      "description": "Города, категории, форматы, языки и диапазон календаря каталога.",
@@ -140,7 +159,12 @@ TOOLS = [
 
 
 def request_dict(request: SearchRequest) -> dict:
-    return {**asdict(request), "event_date": request.event_date.isoformat()}
+    result = {**asdict(request), "event_date": request.event_date.isoformat() if request.event_date else None}
+    if not result["required_categories"]:
+        result.pop("required_categories")
+    else:
+        result["required_categories"] = list(result["required_categories"])
+    return result
 
 
 def result_payload(request, result):
@@ -198,7 +222,7 @@ class SearchTools:
         options = self.options()
         for field, values in (("city", "cities"), ("category", "categories"),
                               ("event_format", "event_formats"), ("language", "languages")):
-            if field == "language" and args[field] is None:
+            if field != "category" and args[field] is None:
                 continue
             if field == "language" and isinstance(args[field], str):
                 languages = requested_languages(SearchRequest("", self.today, "", "", language=args[field]))
@@ -213,6 +237,14 @@ class SearchTools:
             raise ValueError("Длительность: целое число от 1 до 12 или null.")
         if not isinstance(args["preferences"], str) or len(args["preferences"]) > 2000:
             raise ValueError("Пожелания должны быть строкой до 2000 символов.")
+        categories = args.get("required_categories", [])
+        if not isinstance(categories, (list, tuple)) or any(not isinstance(v, str) or v not in options["categories"] or v == "Другое" for v in categories):
+            raise ValueError("Укажите только реальные категории каталога.")
+        if args["category"] == "Другое" or (categories and args["category"] not in categories):
+            raise ValueError("Категория ещё не определена или не соответствует услугам.")
+        args["required_categories"] = tuple(dict.fromkeys(categories))
+        if args["event_date"] is None:
+            return SearchRequest(**args)
         if not isinstance(args["event_date"], str):
             raise ValueError("Дата должна иметь формат YYYY-MM-DD.")
         event_date = date.fromisoformat(args["event_date"])
@@ -252,9 +284,9 @@ class SearchTools:
                     raise ValueError("Профиль с таким ID не найден.")
                 request = self.parse_request(args["request"])
                 reasons = list(rejection_reasons(item, request))
-                if item.city != request.city:
+                if request.city is not None and item.city != request.city:
                     reasons.append("не подходит город")
-                if request.category not in item.categories:
+                if not category_matches(item, request):
                     reasons.append("не подходит категория")
                 return {"id": item.id, "name": item.name, "eligible": not reasons, "reasons": reasons,
                         "price_from_kzt": item.price, "languages": item.languages, "max_hours": item.max_hours,
@@ -273,6 +305,7 @@ class AssistantTurn:
     text: str
     history: list[dict]
     tool_results: list[dict]
+    state: dict | None = None
 
 
 def _provider_error(exc: Exception) -> AssistantError:
@@ -287,7 +320,7 @@ def _provider_error(exc: Exception) -> AssistantError:
 
 
 def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
-             history: list[dict] | None = None, *, client=None, search_tools=None) -> AssistantTurn:
+             history: list[dict] | None = None, *, client=None, search_tools=None, state=None) -> AssistantTurn:
     """Commit a complete turn only on success; never mutate caller-owned history."""
     if not text.strip() or len(text) > 4000:
         raise AssistantError("Введите сообщение длиной от 1 до 4000 символов.")
@@ -297,12 +330,126 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
     if len(json.dumps(messages, ensure_ascii=False)) > MAX_HISTORY_CHARS:
         raise AssistantError("Диалог стал слишком длинным. Начните новый диалог и повторите условия.")
     service = search_tools or SearchTools(contractors)
-    instructions = agent_instructions(service.today)
+    if state is None:
+        # Legacy callers can recover only user-authored conditions, never model guesses.
+        state = empty_state()
+        for message in history or []:
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                state, _, _ = prepare_turn(state, message["content"], service.options(), service.today, contractors)
+    prior_state = deepcopy(state)
+    state, early_reply, viewing = prepare_turn(state, text, service.options(), service.today, contractors)
+    if early_reply:
+        return AssistantTurn(early_reply, [*messages, {"role": "assistant", "content": early_reply}], [], state)
+    instructions = agent_instructions(service.today) + "\nСостояние запроса (данные): " + json.dumps({
+        k: state[k] for k in ("original_need", "required_services", "conditions", "service_mode", "pending_fields")}, ensure_ascii=False)
     owned_client = client is None
-    client = client or create_client(config)
     outputs: list[dict] = []
     call_count = 0
+
+    def finish(answer=""):
+        fallback = fallback_text(outputs, state)
+        answer = safe_text(answer, fallback)
+        searches = [o["result"] for o in outputs if o["name"] == "search_contractors" and "error" not in o["result"]]
+        if searches:
+            allowed = {r["id"] for result in searches for r in result["recommendations"]}
+            if any(c.id not in allowed and c.name.casefold() in answer.casefold() for c in contractors):
+                answer = fallback
+        elif not viewing:
+            asked = question_fields(answer)
+            if any(field in state["conditions"] for field in asked):
+                answer = missing_question(state) or fallback
+                asked = question_fields(answer)
+            state["pending_fields"] = asked
+        # Profile inspection is always framed as inspection, never a recommendation.
+        if viewing and any(o["name"] in ("get_contractor", "explain_contractor_match") and "error" not in o["result"] for o in outputs):
+            answer = fallback
+        return AssistantTurn(answer, [*messages, {"role": "assistant", "content": answer}], outputs, deepcopy(state))
+
+    def execute(name, arguments):
+        if name == "explain_contractor_match":
+            try:
+                supplied = json.loads(arguments)
+                # Explanation always checks the user's current intent, not model-supplied replacements.
+                return execute("get_contractor", json.dumps({"contractor_id": supplied["contractor_id"]}))
+            except (ValueError, TypeError, KeyError):
+                return {"error": "Укажите ID профиля для проверки."}
+        if name == "search_contractors":
+            if viewing:
+                return {"error": "Запрошен просмотр профиля. Поиск и исходные условия не изменены."}
+            if state["awaiting_service_mode"] or state["awaiting_separate"]:
+                return {"error": "Сначала нужен выбор пользователя: один совмещающий или два отдельных специалиста."}
+            expected = search_arguments(state)
+            if expected is None:
+                return {"error": missing_question(state)}
+            try:
+                supplied = json.loads(arguments)
+                if not isinstance(supplied, dict):
+                    raise ValueError()
+                if state["service_mode"] == "separate":
+                    if supplied.get("category") not in state["required_services"]:
+                        raise ValueError()
+                    expected = search_arguments(state, supplied["category"])
+                requested = service.parse_request(supplied)
+                verified = service.parse_request(expected)
+                if requested != verified:
+                    return {"error": "Аргументы меняют услуги или условия без выбора пользователя. Используйте текущее состояние запроса."}
+            except (ValueError, TypeError, KeyError):
+                return {"error": "Укажите корректные аргументы текущего запроса, не подменяя услуги."}
+            result = service.search(verified)
+            previous_results = [r for r in state["last_results"] if r["request"]["category"] != result["request"]["category"]]
+            state["last_results"] = [*previous_results, result]
+            return result
+        result = service.dispatch(name, arguments)
+        if name == "get_contractor" and "error" not in result:
+            item = next(c for c in contractors if c.id == result["id"])
+            mismatches = []
+            if not set(state["required_services"]) <= set(item.categories):
+                mismatches.append("не заявлены все требуемые услуги")
+            conditions = state["conditions"]
+            if conditions.get("city") is not None and conditions["city"] != item.city:
+                mismatches.append("другой город")
+            partial = SearchRequest(conditions.get("city"),
+                date.fromisoformat(conditions["event_date"]) if conditions.get("event_date") else None,
+                conditions.get("event_format"), state["required_services"][0] if state["required_services"] else "",
+                conditions.get("budget"), conditions.get("duration_hours"), conditions.get("language"))
+            mismatches.extend(rejection_reasons(item, partial))
+            result = {**result, "mismatches": mismatches, "inspection_only": True,
+                      "all_conditions_known": all(f in conditions for f in ("city", "event_date", "event_format", "budget", "language", "duration_hours")),
+                      "note": "Просмотр профиля не меняет исходный запрос и не является рекомендацией."}
+            state["viewed_profile"] = item.id
+        return result
+
+    def append_output(call_id, name, result):
+        outputs.append({"name": name, "result": result})
+        serialized = json.dumps(result, ensure_ascii=False)
+        messages.append({"type": "function_call_output", "call_id": call_id, "output": serialized}
+                        if config.provider == "openai" else
+                        {"role": "tool", "tool_call_id": call_id, "content": serialized})
+
+    # A complete explicit request already authorizes search, regardless of model wording.
+    ready = search_arguments(state)
+    if ready is not None and not viewing and (state != prior_state or any(
+            word in text.casefold() for word in ("най", "ищ", "подбер", "поиск", "нуж", "покаж"))):
+        categories = state["required_services"] if state["service_mode"] == "separate" else [None]
+        state["last_results"] = []
+        for index, category in enumerate(categories):
+            arguments = json.dumps(search_arguments(state, category), ensure_ascii=False)
+            call_id = f"local_search_{len(messages)}_{index}"
+            if config.provider == "openai":
+                messages.append({"type": "function_call", "call_id": call_id, "name": "search_contractors", "arguments": arguments})
+            else:
+                messages.append({"role": "assistant", "content": "", "tool_calls": [
+                    {"id": call_id, "type": "function", "function": {"name": "search_contractors", "arguments": arguments}}]})
+            append_output(call_id, "search_contractors", execute("search_contractors", arguments))
+        if any(r["matched_count"] == 0 for r in state["last_results"]) and len(state["required_services"]) > 1 and state["service_mode"] == "combined":
+            state["awaiting_separate"] = True
     try:
+        try:
+            client = client or create_client(config)
+        except Exception:
+            if outputs:
+                return finish()
+            raise
         for _ in range(MAX_ROUNDS):
             try:
                 if config.provider == "openai":
@@ -336,26 +483,24 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
                                                         for call in message.tool_calls]} if calls else {})})
                     answer = message.content or ""
             except AssistantError:
+                if outputs:
+                    return finish()
                 raise
             except Exception as exc:
+                if outputs:
+                    return finish()
                 raise _provider_error(exc) from exc
             if not calls:
-                if not answer.strip():
-                    raise AssistantError("Модель вернула пустой ответ. Попробуйте уточнить запрос.")
-                return AssistantTurn(answer, messages, outputs)
+                return finish(answer)
             call_count += len(calls)
             if call_count > MAX_CALLS:
                 raise AssistantError("Слишком много вызовов поиска. Сформулируйте запрос точнее.")
             for call_id, name, arguments in calls:
-                result = service.dispatch(name, arguments)
-                outputs.append({"name": name, "result": result})
-                serialized = json.dumps(result, ensure_ascii=False)
-                messages.append(
-                    {"type": "function_call_output", "call_id": call_id, "output": serialized}
-                    if config.provider == "openai" else
-                    {"role": "tool", "tool_call_id": call_id, "content": serialized}
-                )
+                result = execute(name, arguments)
+                append_output(call_id, name, result)
+        if state["last_results"]:
+            return finish()
         raise AssistantError("Агент не завершил поиск за 4 шага. Уточните условия или используйте форму.")
     finally:
-        if owned_client:
+        if owned_client and client is not None:
             client.close()

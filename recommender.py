@@ -33,14 +33,15 @@ class Contractor:
 
 @dataclass(frozen=True)
 class SearchRequest:
-    city: str
-    event_date: date
-    event_format: str
+    city: str | None
+    event_date: date | None
+    event_format: str | None
     category: str
     budget: int | None = None
     duration_hours: int | None = None
     language: str | None = None
     preferences: str = ""
+    required_categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,11 +159,22 @@ def requested_languages(request: SearchRequest) -> tuple[str, ...]:
     return tuple(p.strip() for p in re.split(r"[/,|]|\s+и\s+", request.language or "") if p.strip())
 
 
+def requested_categories(request: SearchRequest) -> tuple[str, ...]:
+    return request.required_categories or (request.category,)
+
+
+def category_matches(item: Contractor, request: SearchRequest) -> bool:
+    return all(value in item.categories for value in requested_categories(request))
+
+
 def constraint_checks(item: Contractor, request: SearchRequest):
-    checks = [("Город", item.city == request.city),
-              ("Категория", request.category in item.categories),
-              ("Формат", request.event_format in item.event_formats),
-              ("Свободен", request.event_date.isoformat() not in item.busy_dates)]
+    checks = [("Категория", category_matches(item, request))]
+    if request.city is not None:
+        checks.append(("Город", item.city == request.city))
+    if request.event_format is not None:
+        checks.append(("Формат", request.event_format in item.event_formats))
+    if request.event_date is not None:
+        checks.append(("Свободен", request.event_date.isoformat() not in item.busy_dates))
     if request.budget is not None:
         checks.append(("Бюджет подходит", item.price <= request.budget))
     if request.language:
@@ -174,12 +186,12 @@ def constraint_checks(item: Contractor, request: SearchRequest):
 
 def rejection_reasons(item: Contractor, request: SearchRequest) -> tuple[str, ...]:
     reasons = []
-    if request.event_date.isoformat() in item.busy_dates:
+    if request.event_date is not None and request.event_date.isoformat() in item.busy_dates:
         reasons.append("заняты")
     if request.budget is not None and item.price > request.budget:
         reasons.append("дороже бюджета")
-    if request.event_format not in item.event_formats:
-        reasons.append("не берут формат")
+    if request.event_format is not None and request.event_format not in item.event_formats:
+        reasons.append("формат не заявлен в каталоге")
     if request.language and not all(v in item.languages for v in requested_languages(request)):
         reasons.append("не подходит язык")
     if request.duration_hours is not None and item.max_hours is not None and item.max_hours < request.duration_hours:
@@ -202,8 +214,8 @@ def _explain(contractor: Contractor, request: SearchRequest) -> str:
     profile_fact = evidence or profile_quote(contractor)
     facts = [
         f"В профиле указано: «{profile_fact}»" if profile_fact else "Описание профиля отсутствует",
-        f"свободен по календарю {request.event_date.strftime('%d.%m.%Y')}",
-        f"берёт формат «{request.event_format}»",
+        f"свободен по календарю {request.event_date.strftime('%d.%m.%Y')}" if request.event_date else "дата не ограничена; доступность на конкретную дату не проверялась",
+        f"в каталоге заявлен формат «{request.event_format}»" if request.event_format else "формат не ограничен",
         (f"цена от {contractor.price:,} ₸" +
          (f" при бюджете {request.budget:,} ₸" if request.budget is not None else "; бюджет не ограничен")).replace(",", " "),
     ]
@@ -226,11 +238,15 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
               *, suggest_alternatives: bool = True, semantic_ranker=None,
               related_categories: dict[str, list[str]] | None = None) -> SearchResult:
     catalog = list(contractors)
-    city_pool = [c for c in catalog if c.city == request.city]
-    pool = [c for c in city_pool if request.category in c.categories]
-    pipeline = [("Профилей", len(catalog)), (request.city, len(city_pool)), (request.category, len(pool))]
-    stages = [("Формат", lambda c: request.event_format in c.event_formats),
-              ("Свободны", lambda c: request.event_date.isoformat() not in c.busy_dates)]
+    city_pool = [c for c in catalog if request.city is None or c.city == request.city]
+    pool = [c for c in city_pool if category_matches(c, request)]
+    category_label = " + ".join(requested_categories(request))
+    pipeline = [("Профилей", len(catalog)), (request.city or "Все города", len(city_pool)), (category_label, len(pool))]
+    stages = []
+    if request.event_format is not None:
+        stages.append(("Формат", lambda c: request.event_format in c.event_formats))
+    if request.event_date is not None:
+        stages.append(("Свободны", lambda c: request.event_date.isoformat() not in c.busy_dates))
     if request.budget is not None:
         stages.append(("В бюджете", lambda c: c.price <= request.budget))
     if request.language:
@@ -279,14 +295,17 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
     pipeline.append((f"TOP-{len(selected)}" if limit is not None else "Подходят", len(selected)))
     suggestions = _alternatives(catalog, request, related_categories or {}) if suggest_alternatives else ()
     if not pool:
-        status, message = "category_absent", f"В городе {request.city} нет подрядчиков категории «{request.category}»."
+        status, message = "category_absent", f"В выбранном городе ({request.city or 'любой'}) нет подрядчиков со всеми услугами: {category_label}."
     elif not eligible:
         status = "conditions_not_met"
         message = (f"В каталоге города {request.city} есть профили категории «{request.category}»: {len(pool)}. "
-                   f"На {request.event_date:%d.%m.%Y} по заданным условиям подходящих нет.")
+                   f"По заданным условиям подходящих нет" +
+                   (f" на {request.event_date:%d.%m.%Y}." if request.event_date else "."))
     else:
         status = "matched"
         message = f"Подобрано {len(selected)} из {len(eligible)} подходящих подрядчиков. В категории всего {len(pool)}."
+    if len(requested_categories(request)) > 1 and not eligible:
+        message += " Можно рассмотреть отдельно фотографа и видеографа. Искать двух исполнителей? Условия пока не изменены."
     if counts:
         message += " Причины отсева: " + "; ".join(f"{name}: {count}" for name, count in counts.items()) + ". Причины могут пересекаться."
     return SearchResult(status=status, message=message, recommendations=selected,
@@ -298,7 +317,7 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
 def _alternatives(catalog: list[Contractor], request: SearchRequest,
                   related_categories: dict[str, list[str]]) -> tuple[Suggestion, ...]:
     def matches(changed):
-        return {c.id for c in catalog if c.city == changed.city and changed.category in c.categories
+        return {c.id for c in catalog if (changed.city is None or c.city == changed.city) and category_matches(c, changed)
                 and not rejection_reasons(c, changed)}
 
     baseline = matches(request)
@@ -313,11 +332,11 @@ def _alternatives(catalog: list[Contractor], request: SearchRequest,
         return added
 
     if not baseline:
-        for offset in range(1, (CALENDAR_END - request.event_date).days + 1):
+        for offset in range(1, (CALENDAR_END - request.event_date).days + 1 if request.event_date else 1):
             changed = replace(request, event_date=request.event_date + timedelta(days=offset))
             if offer(changed, "date", f"Дата {changed.event_date:%d.%m.%Y}"):
                 break
-        prices = sorted({c.price for c in catalog if c.city == request.city and request.category in c.categories
+        prices = sorted({c.price for c in catalog if (request.city is None or c.city == request.city) and category_matches(c, request)
                          and request.budget is not None and c.price > request.budget})
         for price in prices:
             if offer(replace(request, budget=price), "budget",
@@ -329,7 +348,7 @@ def _alternatives(catalog: list[Contractor], request: SearchRequest,
         for hours in range(request.duration_hours - 1, 0, -1):
             if offer(replace(request, duration_hours=hours), "duration", f"Сократить до {hours} ч"):
                 break
-    for category in related_categories.get(request.category, []):
+    for category in (related_categories.get(request.category, []) if len(requested_categories(request)) == 1 else []):
         if category != request.category:
-            offer(replace(request, category=category), "category", f"Сменить категорию на «{category}»")
+            offer(replace(request, category=category, required_categories=()), "category", f"Сменить категорию на «{category}»")
     return tuple(suggestions)

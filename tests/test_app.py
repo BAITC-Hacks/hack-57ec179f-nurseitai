@@ -107,3 +107,29 @@ class AppTests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertTrue(app.error)
             self.assertTrue(all(not s["history"] for s in app.session_state["ai_sessions"].values()))
+
+    def test_combined_manual_services_and_unlimited_date_round_trip(self):
+        app = self.app().run()
+        app.selectbox(key="category").select("Фотограф")
+        app.multiselect(key="additional_categories").set_value(["Видеограф"])
+        app.checkbox(key="date_unlimited").check()
+        app.button(key="manual_submit").click().run()
+        self.assertFalse(app.exception)
+        request = app.session_state["active_result"]["request"]
+        self.assertEqual(request["required_categories"], ["Фотограф", "Видеограф"])
+        self.assertIsNone(request["event_date"])
+        self.assertFalse(any("Как сужался выбор" in c.value for c in app.caption))
+        for session in app.session_state["ai_sessions"].values():
+            self.assertEqual(session["state"]["required_services"], ["Фотограф", "Видеограф"])
+        app.button(key="history_0").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(app.checkbox(key="date_unlimited").value)
+        self.assertEqual(app.multiselect(key="additional_categories").value, ["Видеограф"])
+
+    def test_unknown_service_has_no_stale_result_or_json_in_chat(self):
+        app = self.app().run()
+        app.button(key="manual_submit").click().run()
+        app.chat_input(key="ai_message").set_value("Нужен тестировщик").run()
+        self.assertFalse(app.exception)
+        self.assertFalse(any(h.value == "Ваше мероприятие" for h in app.header))
+        self.assertTrue(any("Какую задачу" in m.value for m in app.markdown))

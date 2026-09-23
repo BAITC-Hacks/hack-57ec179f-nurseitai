@@ -1,5 +1,3 @@
-from html import escape
-
 import streamlit as st
 
 from assistant_ui import describe_request
@@ -12,14 +10,6 @@ def render_result(payload, on_request, debug=False):
     st.header("Ваше мероприятие")
     st.write(describe_request(request))
     st.caption("Измените условия сообщением агенту или в «Ручной настройке».")
-    stages = payload.get("pipeline", [])
-    pills = [f'<span style="padding:8px 12px;border:1px solid #596575;border-radius:12px;white-space:nowrap">'
-             f'<b>{count}</b> {escape(label)}</span>' for label, count in stages[:-1]]
-    pills.append(f'<span style="padding:8px 12px;background:#174f42;color:white;border-radius:12px;white-space:nowrap">'
-                 f'<b>TOP-{min(3, payload["matched_count"])}</b></span>')
-    st.markdown('<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0">' +
-                '<span>→</span>'.join(pills) + '</div>', unsafe_allow_html=True)
-    st.caption("Как сужался выбор — каждый следующий этап учитывает предыдущие.")
     (st.success if payload["status"] == "matched" else st.warning)(payload["message"])
     if payload.get("ranking_mode") == "fallback":
         st.caption(payload["ranking_notice"])
@@ -82,7 +72,7 @@ def render_result(payload, on_request, debug=False):
     if payload["suggestions"]:
         st.subheader("Что можно изменить")
         for index, suggestion in enumerate(payload["suggestions"]):
-            st.button(suggestion["message"], key=f"suggestion_{index}", on_click=on_request,
+            st.button(suggestion["message"], key=f"suggestion_{index}" if not st.session_state.get("separate_results") else f"suggestion_{key}_{index}", on_click=on_request,
                       args=(suggestion["request"],))
     elif not cards:
         st.info("Изменение только даты, бюджета, языка или длительности не дало вариантов. Уточните другие условия.")

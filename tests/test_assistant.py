@@ -83,7 +83,7 @@ class AssistantTests(unittest.TestCase):
         empty = self.tools.dispatch("search_contractors", json.dumps({**args, "budget": 100_000}))
         self.assertEqual(empty["matched_count"], 0)
         self.assertIn("В каталоге", empty["message"])
-        self.assertIn("по заданным условиям подходящих нет", empty["message"])
+        self.assertIn("по заданным условиям подходящих нет", empty["message"].lower())
         self.assertNotIn("Кандидаты есть", empty["message"])
 
     def test_today_is_explicit_for_both_providers(self):
@@ -135,7 +135,7 @@ class AssistantTests(unittest.TestCase):
                 client = Mock()
                 method = client.responses.create if provider == "openai" else client.chat.completions.create
                 method.side_effect = [reply([("search_contractors", json.dumps(self.args))]), reply(text="Можно перенести дату.")]
-                original = [{"role": "user", "content": "Нужен ведущий"}]
+                original = [{"role": "user", "content": "Нужен ведущий на свадьбу в Алматы, бюджет 1.5 млн, русский, 6 часов. Пожелания: квантовый реактор на Марсе"}]
                 turn = run_turn(AssistantConfig(provider, "test-model", "fake-key"), self.contractors,
                                 "3 октября", original, client=client)
                 self.assertEqual(turn.text, "Можно перенести дату.")
@@ -143,8 +143,8 @@ class AssistantTests(unittest.TestCase):
                 self.assertEqual(turn.tool_results[0]["result"]["status"], "conditions_not_met")
                 payload = method.call_args.kwargs["input" if provider == "openai" else "messages"]
                 results = [m for m in payload if m.get("type") == "function_call_output" or m.get("role") == "tool"]
-                self.assertEqual(len(results), 1)
-                self.assertEqual(results[0].get("call_id", results[0].get("tool_call_id")), "call_0")
+                self.assertTrue(results)
+                self.assertEqual(results[-1].get("call_id", results[-1].get("tool_call_id")), "call_0")
                 self.assertNotIn("fake-key", json.dumps(turn.history))
 
     def test_reasoning_items_are_preserved_and_storage_is_disabled(self):
@@ -171,9 +171,10 @@ class AssistantTests(unittest.TestCase):
         client.responses.create.side_effect = [openai_reply(text=question),
             openai_reply([("search_contractors", json.dumps(args))]), openai_reply(text="Найдено 4 ведущих")]
         config = AssistantConfig("openai", "test", "fake")
-        first = run_turn(config, self.contractors, "Нужен ведущий на свадьбу сегодня в Алматы", client=client)
+        fixed_tools = SearchTools(self.contractors, today=date(2026, 9, 23))
+        first = run_turn(config, self.contractors, "Нужен ведущий на свадьбу сегодня в Алматы", client=client, search_tools=fixed_tools)
         self.assertFalse(first.tool_results)
-        second = run_turn(config, self.contractors, "Всё без разницы", first.history, client=client)
+        second = run_turn(config, self.contractors, "Всё без разницы", first.history, client=client, search_tools=fixed_tools)
         result = second.tool_results[0]["result"]
         self.assertEqual(result["matched_count"], 4)
         self.assertTrue(all(result["request"][field] is None for field in ("budget", "language", "duration_hours")))

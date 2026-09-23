@@ -45,7 +45,7 @@ def comparison_rows(cards, request):
                      "Языки": ", ".join(card["languages"]),
                      "Длительность": f"до {card['max_hours']} ч" if card["max_hours"] else "Не привязана ко времени",
                      "Опыт (со слов профиля)": experience.group(0).strip() if experience else "Не выделен из описания",
-                     "Свободен по календарю": request["event_date"],
+                     "Свободен по календарю": request["event_date"] or "Дата не задана — не проверено",
                      "Почему подходит": quote or "Описание отсутствует",
                      "Пожелания": ("Не заданы" if not request["preferences"] else
                                    card["preference_evidence"] or "Не подтверждены описанием")})
@@ -55,7 +55,7 @@ def comparison_rows(cards, request):
 def detailed_reasons(candidate, request):
     labels = {"заняты": f"Занят {request['event_date']}",
               "дороже бюджета": f"Цена от {candidate['price_from_kzt']:,} ₸ выше бюджета {request['budget']:,} ₸".replace(",", " ") if request['budget'] is not None else "",
-              "не берут формат": f"Формат «{request['event_format']}» не указан",
+              "формат не заявлен в каталоге": f"Формат «{request['event_format']}» не заявлен в каталоге",
               "не подходит язык": f"Нужен {request['language']}; в профиле: {', '.join(candidate['languages'])}",
               "не подходит длительность": f"Нужно {request['duration_hours']} ч; максимум {candidate['max_hours']} ч"}
     return [labels.get(reason, reason) for reason in candidate["reasons"]]
