@@ -1,9 +1,20 @@
 """Streamlit chat; credentials never enter chat history or tool arguments."""
 import json
+from datetime import date
 
 import streamlit as st
 
-from assistant import AssistantConfig, AssistantError, SearchTools, request_dict, run_turn
+from assistant import CHAT_VERSION, AssistantConfig, AssistantError, SearchTools, request_dict, run_turn
+
+
+def describe_request(request):
+    event_date = date.fromisoformat(request["event_date"]).strftime("%d.%m.%Y")
+    parts = [request["city"], request["category"], request["event_format"], event_date]
+    parts.append("бюджет без ограничений" if request["budget"] is None else
+                 f"бюджет до {request['budget']:,} ₸".replace(",", " "))
+    parts.append(f"язык: {request['language']}" if request["language"] else "любой язык")
+    parts.append(f"длительность: {request['duration_hours']} ч" if request["duration_hours"] else "без ограничения длительности")
+    return " · ".join(parts)
 
 
 def render_assistant(contractors, apply_request):
@@ -26,7 +37,7 @@ def render_assistant(contractors, apply_request):
     st.caption(f"Модель: {config.model}")
     # Provider/model changes never forward a previous provider's conversation.
     sessions = st.session_state.setdefault("ai_sessions", {})
-    session_key = (provider, config.model)
+    session_key = (provider, config.model, CHAT_VERSION)
     session = sessions.setdefault(session_key, {"history": [], "display": []})
     if st.button("Новый диалог", key="ai_reset"):
         sessions[session_key] = {"history": [], "display": []}
@@ -48,7 +59,7 @@ def render_assistant(contractors, apply_request):
                 with st.container(border=True):
                     st.write("**Результат проверки по каталогу**")
                     st.write(result["message"])
-                    st.caption(str(result["request"]))
+                    st.caption(describe_request(result["request"]))
                     for rec in result["recommendations"]:
                         st.write(f"**{rec['name']} · {rec['id']}**")
                         st.write(rec["explanation"])

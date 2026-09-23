@@ -35,7 +35,7 @@ class SearchRequest:
     event_date: date
     event_format: str
     category: str
-    budget: int
+    budget: int | None = None
     duration_hours: int | None = None
     language: str | None = None
     preferences: str = ""
@@ -148,7 +148,8 @@ def _text_relevance(query: str, documents: list[str]) -> list[float]:
 def _score_factors(
     contractor: Contractor, request: SearchRequest, relevance: float
 ) -> tuple[tuple[str, float], ...]:
-    budget_cushion = max(0.0, 1.0 - contractor.price / request.budget)
+    # Unspecified budget is no price filter and no price-based scoring bonus.
+    budget_cushion = max(0.0, 1.0 - contractor.price / request.budget) if request.budget is not None else 0.0
     budget_score = 10 + 10 * budget_cushion
 
     if request.duration_hours is None:
@@ -182,7 +183,8 @@ def _explain(contractor: Contractor, request: SearchRequest) -> str:
         f"В профиле указано: «{profile_fact}»" if profile_fact else "Описание профиля отсутствует",
         f"свободен по календарю {request.event_date.strftime('%d.%m.%Y')}",
         f"берёт формат «{request.event_format}»",
-        f"цена от {contractor.price:,} ₸ при бюджете {request.budget:,} ₸".replace(",", " "),
+        (f"цена от {contractor.price:,} ₸" +
+         (f" при бюджете {request.budget:,} ₸" if request.budget is not None else "; бюджет не ограничен")).replace(",", " "),
     ]
     if request.language:
         facts.append(f"работает на языке «{request.language}»")
@@ -200,7 +202,7 @@ def _explain(contractor: Contractor, request: SearchRequest) -> str:
 
 
 def recommend(
-    contractors: Iterable[Contractor], request: SearchRequest, limit: int = 3,
+    contractors: Iterable[Contractor], request: SearchRequest, limit: int | None = 3,
     *, suggest_alternatives: bool = True
 ) -> SearchResult:
     pool = [
@@ -222,7 +224,7 @@ def recommend(
         reasons: list[str] = []
         if requested_date in item.busy_dates:
             reasons.append("заняты")
-        if item.price > request.budget:
+        if request.budget is not None and item.price > request.budget:
             reasons.append("дороже бюджета")
         if request.event_format not in item.event_formats:
             reasons.append("не берут формат")
@@ -246,7 +248,9 @@ def recommend(
         detail = ", ".join(f"{name}: {count}" for name, count in rejection_counts)
         return SearchResult(
             status="conditions_not_met",
-            message=f"Кандидаты есть, но никто не прошёл условия. {detail}.",
+            message=(f"В каталоге города {request.city} есть профили категории «{request.category}»: {len(pool)}. "
+                     f"На {request.event_date:%d.%m.%Y} по заданным условиям подходящих нет. "
+                     f"Причины отсева: {detail}. Причины могут пересекаться."),
             rejection_counts=rejection_counts,
             suggestions=_alternatives(pool, request) if suggest_alternatives else (),
         )
@@ -277,7 +281,7 @@ def recommend(
         )
         for item in ranked[:limit]
     )
-    suffix = "" if len(eligible) >= limit else f" Подходящих найдено только {len(eligible)}."
+    suffix = "" if limit is None or len(eligible) >= limit else f" Подходящих найдено только {len(eligible)}."
     detail = "; ".join(f"{name}: {count}" for name, count in rejection_counts)
     summary = f" В городе {request.city}, категория «{request.category}»: всего {len(pool)}."
     if detail:
@@ -305,7 +309,7 @@ def _alternatives(pool: list[Contractor], request: SearchRequest) -> tuple[Sugge
                 f"Если перенести мероприятие на {changed.event_date:%d.%m.%Y}, "
                 f"доступно вариантов: {count}. Остальные условия сохранены."))
             break
-    for price in sorted({item.price for item in pool if item.price > request.budget}):
+    for price in sorted({item.price for item in pool if request.budget is not None and item.price > request.budget}):
         changed = replace(request, budget=price)
         count = count_matches(changed)
         if count:

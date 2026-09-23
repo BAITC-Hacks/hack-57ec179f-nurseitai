@@ -10,8 +10,33 @@ from recommender import load_contractors
 
 
 class AppTests(unittest.TestCase):
+    def test_unlimited_agent_search_renders_all_and_applies_without_hidden_budget(self):
+        path = Path(__file__).parents[1]
+        import json
+        result = SearchTools(load_contractors(path / "data/contractors.csv")).dispatch(
+            "search_contractors", json.dumps(dict(city="Алматы", event_date="2026-09-23",
+                                                  event_format="свадьба", category="Ведущий")))
+        turn = AssistantTurn("Найдено 4 ведущих.", [], [{"name": "search_contractors", "result": result}])
+        app = AppTest.from_file(str(path / "app.py"))
+        app.secrets["OPENAI_API_KEY"] = "test-openai"
+        with patch("assistant_ui.run_turn", return_value=turn):
+            app.run()
+            app.chat_input(key="ai_message").set_value("Нужен ведущий на свадьбу сегодня в Алматы").run()
+            self.assertFalse(app.exception)
+            rendered = " ".join(m.value for m in app.markdown)
+            for name in ("Мицури Канроджи", "Эмилия", "Сон Гоку", "Софи Хаттер"):
+                self.assertIn(name, rendered)
+            self.assertTrue(any("бюджет без ограничений" in c.value for c in app.caption))
+            next(b for b in app.button if b.label == "Применить условия поиска к форме").click().run()
+            self.assertFalse(app.exception)
+            self.assertTrue(app.checkbox(key="budget_unlimited").value)
+            self.assertIsNone(app.session_state["search_request"].budget)
+            app.button[0].click().run()
+            self.assertFalse(app.exception)
+            self.assertIsNone(app.session_state["search_request"].budget)
+
     def test_chat_without_credentials_preserves_regular_search(self):
-        with patch.dict("os.environ", {"OPENAI_API_KEY": "", "NVIDIA_API_KEY": ""}):
+        with patch("assistant_ui.AssistantConfig.from_settings", side_effect=AssistantError("Добавьте API-ключ")):
             app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py")).run()
             self.assertFalse(app.exception)
             self.assertTrue(app.chat_input[0].disabled)

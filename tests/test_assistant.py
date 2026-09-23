@@ -1,11 +1,13 @@
 import json
 import unittest
+from datetime import date
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from assistant import (AssistantConfig, AssistantError, SearchTools, run_turn,
-                       request_dict, MAX_CALLS, MAX_ROUNDS)
+                       request_dict, agent_instructions, MAX_CALLS, MAX_ROUNDS)
 from recommender import load_contractors
 
 
@@ -54,6 +56,58 @@ class AssistantTests(unittest.TestCase):
         found = self.tools.dispatch("search_contractors", json.dumps(alternative["request"]))
         self.assertEqual(len(found["recommendations"]), 2)
         self.assertTrue(all("пожелание не подтверждено" in r["explanation"] for r in found["recommendations"]))
+
+    def test_unspecified_budget_returns_all_available_wedding_hosts(self):
+        args = dict(city="Алматы", event_date="2026-09-23", event_format="свадьба", category="Ведущий")
+        result = self.tools.dispatch("search_contractors", json.dumps(args))
+        self.assertEqual(result["status"], "matched")
+        self.assertIsNone(result["request"]["budget"])
+        self.assertIsNone(result["request"]["language"])
+        self.assertIsNone(result["request"]["duration_hours"])
+        self.assertEqual(result["matched_count"], 4)
+        self.assertEqual({r["name"] for r in result["recommendations"]},
+                         {"Мицури Канроджи", "Эмилия", "Сон Гоку", "Софи Хаттер"})
+        self.assertNotIn("дороже бюджета", result["rejection_counts"])
+        self.assertFalse(result["suggestions"])
+        self.assertTrue(all("бюджет не ограничен" in r["explanation"] for r in result["recommendations"]))
+        explicit_null = self.tools.dispatch("search_contractors", json.dumps({**args, "budget": None,
+                      "language": None, "duration_hours": None, "preferences": ""}))
+        self.assertEqual(result, explicit_null)
+
+    def test_explicit_budget_still_filters_and_empty_message_distinguishes_catalog(self):
+        args = {**self.args, "event_date": "2026-09-23", "budget": 1_000_000,
+                "language": None, "duration_hours": None, "preferences": ""}
+        result = self.tools.dispatch("search_contractors", json.dumps(args))
+        self.assertEqual(result["matched_count"], 3)
+        self.assertTrue(all(r["price_from_kzt"] <= 1_000_000 for r in result["recommendations"]))
+        empty = self.tools.dispatch("search_contractors", json.dumps({**args, "budget": 100_000}))
+        self.assertEqual(empty["matched_count"], 0)
+        self.assertIn("В каталоге", empty["message"])
+        self.assertIn("по заданным условиям подходящих нет", empty["message"])
+        self.assertNotIn("Кандидаты есть", empty["message"])
+
+    def test_today_is_explicit_for_both_providers(self):
+        fixed_today = date(2026, 10, 14)
+        self.assertIn("Сегодня = 2026-10-14, завтра = 2026-10-15", agent_instructions(fixed_today))
+        for provider, reply in (("openai", openai_reply), ("nvidia", nvidia_reply)):
+            client = Mock()
+            method = client.responses.create if provider == "openai" else client.chat.completions.create
+            method.return_value = reply(text="Уточните город")
+            with patch("assistant.current_event_date", return_value=fixed_today):
+                run_turn(AssistantConfig(provider, "test", "fake"), self.contractors, "На сегодня", client=client)
+            instructions = (method.call_args.kwargs["instructions"] if provider == "openai"
+                            else method.call_args.kwargs["messages"][0]["content"])
+            self.assertIn("Сегодня = 2026-10-14", instructions)
+            self.assertIn("budget=null", instructions)
+
+    def test_unlimited_budget_empty_result_only_suggests_date(self):
+        args = {**self.args, "budget": None}
+        pool = [replace(c, busy_dates=c.busy_dates | {args["event_date"]}) for c in self.contractors]
+        result = SearchTools(pool).dispatch("search_contractors", json.dumps(args))
+        self.assertEqual(result["status"], "conditions_not_met")
+        self.assertTrue(result["suggestions"])
+        self.assertTrue(all(s["request"]["budget"] is None for s in result["suggestions"]))
+        self.assertTrue(all(s["request"]["event_date"] != args["event_date"] for s in result["suggestions"]))
 
     def test_validation_rejects_malformed_missing_extra_and_out_of_range_arguments(self):
         for raw in ("{", "[]", "null", "{}", json.dumps({**self.args, "code": "print(1)"})):
@@ -104,10 +158,10 @@ class AssistantTests(unittest.TestCase):
 
     def test_incomplete_request_can_be_clarified_without_calling_tools(self):
         client = Mock()
-        client.responses.create.return_value = openai_reply(text="На какую дату и какой бюджет?")
+        client.responses.create.return_value = openai_reply(text="В каком городе и на какую дату?")
         turn = run_turn(AssistantConfig("openai", "test", "fake"), self.contractors, "Нужен ведущий", client=client)
         self.assertFalse(turn.tool_results)
-        self.assertIn("бюджет", turn.text)
+        self.assertIn("дату", turn.text)
 
     def test_invalid_arguments_are_returned_to_model_for_correction(self):
         client = Mock()

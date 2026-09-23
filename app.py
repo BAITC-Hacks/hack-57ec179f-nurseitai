@@ -41,6 +41,7 @@ formats = sorted({value for item in contractors for value in item.event_formats}
 languages = sorted({value for item in contractors for value in item.languages})
 st.session_state.setdefault("event_date", date(2026, 10, 14))
 st.session_state.setdefault("budget", 1_500_000)
+st.session_state.setdefault("budget_unlimited", False)
 st.session_state.setdefault("category", "Ведущий")
 st.session_state.setdefault("event_format", "свадьба")
 st.session_state.setdefault("language", "русский")
@@ -51,7 +52,9 @@ def apply_suggestion(request):
     st.session_state.search_request = request
     for key, value in dict(city=request.city, event_date=request.event_date,
                            category=request.category, event_format=request.event_format,
-                           budget=request.budget, language=request.language or "Неважно",
+                           budget=request.budget if request.budget is not None else st.session_state.budget,
+                           budget_unlimited=request.budget is None,
+                           language=request.language or "Неважно",
                            duration=request.duration_hours or "Неважно",
                            preferences=request.preferences).items():
         st.session_state[key] = value
@@ -70,7 +73,9 @@ with st.form("search"):
         category = st.selectbox("Категория", categories, key="category")
     with middle:
         event_format = st.selectbox("Формат мероприятия", formats, key="event_format")
-        budget = st.number_input("Бюджет, ₸", min_value=100_000, step=50_000, key="budget")
+        budget_unlimited = st.checkbox("Без ограничения бюджета", key="budget_unlimited",
+                                       help="При включении цена не ограничивает поиск; сумма ниже не используется.")
+        budget = st.number_input("Бюджет, ₸", min_value=1, step=50_000, key="budget")
         language_options = ["Неважно", *languages]
         language = st.selectbox("Язык", language_options, key="language")
     with right:
@@ -94,7 +99,7 @@ if submitted:
         event_date=event_date,
         event_format=event_format,
         category=category,
-        budget=int(budget),
+        budget=None if budget_unlimited else int(budget),
         duration_hours=None if duration == "Неважно" else int(duration),
         language=None if language == "Неважно" else language,
         preferences=preferences,
