@@ -138,7 +138,7 @@ class AssistantTests(unittest.TestCase):
                 original = [{"role": "user", "content": "Нужен ведущий на свадьбу в Алматы, бюджет 1.5 млн, русский, 6 часов. Пожелания: квантовый реактор на Марсе"}]
                 turn = run_turn(AssistantConfig(provider, "test-model", "fake-key"), self.contractors,
                                 "3 октября", original, client=client)
-                self.assertEqual(turn.text, "Можно перенести дату.")
+                self.assertIn("Какое условие готовы изменить?", turn.text)
                 self.assertEqual(len(original), 1)
                 self.assertEqual(turn.tool_results[0]["result"]["status"], "conditions_not_met")
                 payload = method.call_args.kwargs["input" if provider == "openai" else "messages"]

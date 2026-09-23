@@ -189,3 +189,39 @@ class DialogueRegressions(unittest.TestCase):
         self.assertFalse(second.state["awaiting_service_mode"])
         self.assertEqual(second.state["required_services"], ["Фотограф"])
         self.assertTrue(second.state["last_results"])
+
+    def test_original_need_survives_clarification_and_unknown_service_with_city(self):
+        first, _ = self.turn("Нужен тестировщик в Алматы")
+        second, _ = self.turn("Нужен фотограф", first.state)
+        self.assertEqual(second.state["original_need"], "Нужен тестировщик в Алматы")
+        self.assertEqual(second.state["current_need"], "Нужен фотограф")
+        self.assertEqual(second.state["conditions"]["city"], "Алматы")
+        third, _ = self.turn("Нужен программист в Алматы", second.state)
+        self.assertFalse(third.state["required_services"])
+        self.assertIn("задачу", third.text)
+
+    def test_negative_booth_mention_is_not_a_requested_service(self):
+        first, _ = self.turn("Нужен фотограф, не фотобудка", state_from_request(self.request))
+        self.assertEqual(first.state["required_services"], ["Фотограф"])
+
+    def test_empty_results_ask_to_refine_without_changing_conditions(self):
+        state = state_from_request({**self.request, "budget": 1})
+        turn, _ = self.turn("Найди", state, openai_reply(text="Вот отличные варианты"))
+        self.assertIn("Какое условие готовы изменить?", turn.text)
+        self.assertEqual(turn.state["conditions"], state["conditions"])
+        self.assertFalse(turn.state["last_results"][0]["recommendations"])
+
+    def test_profile_facts_are_individual_and_tied_to_catalog_fields(self):
+        first = replace(self.catalog[0], description="Опыт ведения свадеб 13 лет.", languages=("русский", "казахский"))
+        second = replace(first, id="second", name="Другой", description="Тонкий юмор и сдержанные манеры.", languages=("русский",))
+        service = SearchTools([first, second], today=self.today)
+        result = service.search(service.parse_request({**self.request, "preferences": "квантовый реактор на Марсе"}))
+        cards = result["recommendations"]
+        self.assertNotEqual(cards[0]["profile_facts"], cards[1]["profile_facts"])
+        for card in cards:
+            original = first if card["id"] == first.id else second
+            facts = {f["source"]: f["value"] for f in card["profile_facts"]}
+            self.assertIn(facts["description"], original.description)
+            self.assertEqual(facts["languages"], ", ".join(original.languages))
+            self.assertFalse(card["preference_evidence"])
+            self.assertIn("пожелание не подтверждено описанием", card["explanation"])

@@ -11,6 +11,8 @@ def render_result(payload, on_request, debug=False):
     st.write(describe_request(request))
     st.caption("Измените условия сообщением агенту или в «Ручной настройке».")
     (st.success if payload["status"] == "matched" else st.warning)(payload["message"])
+    if payload.get("clarification"):
+        st.info(payload["clarification"])
     if payload.get("ranking_mode") == "fallback":
         st.caption(payload["ranking_notice"])
     cards = payload["recommendations"]
@@ -24,10 +26,15 @@ def render_result(payload, on_request, debug=False):
             st.metric("Цена от", f"{rec['price_from_kzt']:,} ₸".replace(",", " "))
             st.progress(rec["match_percent"] / 100, text=f"Match {rec['match_percent']}% · подтверждено")
             st.write(" · ".join("✓ " + value for value in rec["checks"] if value not in ("Город", "Категория")))
-            if rec["max_hours"] is not None:
-                st.caption(f"В профиле указано: максимум {rec['max_hours']} ч.")
             st.write("**Особенность профиля**")
-            st.write(f"В профиле указано: «{rec['profile_quote']}»" if rec["profile_quote"] else "Описание отсутствует.")
+            if rec.get("profile_facts"):
+                for fact in rec["profile_facts"]:
+                    if fact["source"] == "description":
+                        st.write(f"В профиле указано: «{fact['value']}»")
+                    else:
+                        st.caption(f"{fact['label']}: {fact['value']}")
+            else:
+                st.write(f"В профиле указано: «{rec['profile_quote']}»" if rec["profile_quote"] else "Описание отсутствует.")
             if request["preferences"]:
                 if rec["preference_evidence"]:
                     st.write(f"★ Фрагменты по пожеланию: «{rec['preference_evidence']}»")
@@ -74,7 +81,7 @@ def render_result(payload, on_request, debug=False):
         for index, suggestion in enumerate(payload["suggestions"]):
             st.button(suggestion["message"], key=f"suggestion_{index}" if not st.session_state.get("separate_results") else f"suggestion_{key}_{index}", on_click=on_request,
                       args=(suggestion["request"],))
-    elif not cards:
+    elif not cards and not payload.get("clarification"):
         st.info("Изменение только даты, бюджета, языка или длительности не дало вариантов. Уточните другие условия.")
     with st.expander(f"Почему не эти подрядчики? ({len(payload.get('near_matches', []))})"):
         st.caption("Эти профили не прошли обязательные условия и не входят в рекомендации. Причины могут пересекаться.")

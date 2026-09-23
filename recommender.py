@@ -84,6 +84,7 @@ class SearchResult:
     matched_count: int = 0
     ranking_mode: str = "local"
     ranking_notice: str = ""
+    clarification: str = ""
 
 
 CALENDAR_END = date(2026, 12, 31)
@@ -208,6 +209,18 @@ def profile_quote(item: Contractor) -> str:
     return part if len(part) <= 240 else part[:240].rsplit(" ", 1)[0] + "…"
 
 
+def profile_facts(item: Contractor):
+    """Facts tied to this exact catalog row; description quotes are self-reported."""
+    facts = [{"label": "Заявленные услуги", "value": ", ".join(item.categories), "source": "categories"},
+             {"label": "Заявленные языки", "value": ", ".join(item.languages) or "Не указаны", "source": "languages"}]
+    quote = profile_quote(item)
+    if quote:
+        facts.insert(0, {"label": "Со слов профиля", "value": quote, "source": "description"})
+    if item.max_hours is not None:
+        facts.append({"label": "Максимальная длительность", "value": f"{item.max_hours} ч", "source": "max_hours"})
+    return facts
+
+
 def _explain(contractor: Contractor, request: SearchRequest) -> str:
     fragments = _fragments(contractor.description)
     evidence = _preference_evidence(request.preferences, contractor.description)
@@ -304,14 +317,22 @@ def recommend(contractors: Iterable[Contractor], request: SearchRequest, limit: 
     else:
         status = "matched"
         message = f"Подобрано {len(selected)} из {len(eligible)} подходящих подрядчиков. В категории всего {len(pool)}."
-    if len(requested_categories(request)) > 1 and not eligible:
-        message += " Можно рассмотреть отдельно фотографа и видеографа. Искать двух исполнителей? Условия пока не изменены."
+    clarification = ""
+    if not eligible:
+        if len(requested_categories(request)) > 1:
+            clarification = f"Подрядчика со всеми услугами «{category_label}» по этим условиям нет. Рассмотреть отдельных исполнителей для каждой услуги?"
+        elif not pool:
+            clarification = "В выбранном городе такой услуги нет. Рассмотреть другой город или уточнить, какую задачу должен выполнять специалист?"
+        elif suggestions:
+            clarification = "Какое условие готовы изменить? Можно выбрать проверенный вариант ниже или уточнить запрос сообщением."
+        else:
+            clarification = "По этому запросу вариантов нет. Какую именно задачу должен решить подрядчик и какое условие можно изменить?"
     if counts:
         message += " Причины отсева: " + "; ".join(f"{name}: {count}" for name, count in counts.items()) + ". Причины могут пересекаться."
     return SearchResult(status=status, message=message, recommendations=selected,
                         rejection_counts=tuple(counts.items()), suggestions=suggestions,
                         pipeline=tuple(pipeline), near_matches=near, matched_count=len(eligible),
-                        ranking_mode=mode, ranking_notice=notice)
+                        ranking_mode=mode, ranking_notice=notice, clarification=clarification)
 
 
 def _alternatives(catalog: list[Contractor], request: SearchRequest,

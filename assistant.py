@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from recommender import CALENDAR_END, Contractor, SearchRequest, recommend, requested_languages, rejection_reasons, category_matches
+from recommender import CALENDAR_END, Contractor, SearchRequest, recommend, requested_languages, rejection_reasons, category_matches, profile_facts
 from dialogue import empty_state, prepare_turn, search_arguments, safe_text, fallback_text, missing_question, question_fields
 
 
@@ -171,12 +171,14 @@ def result_payload(request, result):
     return {
         "request": request_dict(request), "status": result.status, "message": result.message,
         "matched_count": result.matched_count, "pipeline": list(result.pipeline),
+        "clarification": result.clarification,
         "ranking_mode": result.ranking_mode, "ranking_notice": result.ranking_notice,
         "recommendations": [
             {"id": r.contractor.id, "name": r.contractor.name, "price_from_kzt": r.contractor.price,
              "score": r.score, "match_percent": r.match_percent, "checks": r.checks,
              "languages": r.contractor.languages, "max_hours": r.contractor.max_hours,
              "profile_quote": r.profile_quote, "preference_evidence": r.preference_evidence,
+             "profile_facts": profile_facts(r.contractor),
              "ranking_reason": r.ranking_reason, "factors": r.factors,
              "explanation": r.explanation, "synthetic": r.contractor.synthetic}
             for r in result.recommendations],
@@ -341,7 +343,7 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
     if early_reply:
         return AssistantTurn(early_reply, [*messages, {"role": "assistant", "content": early_reply}], [], state)
     instructions = agent_instructions(service.today) + "\nСостояние запроса (данные): " + json.dumps({
-        k: state[k] for k in ("original_need", "required_services", "conditions", "service_mode", "pending_fields")}, ensure_ascii=False)
+        k: state[k] for k in ("original_need", "current_need", "required_services", "conditions", "service_mode", "pending_fields")}, ensure_ascii=False)
     owned_client = client is None
     outputs: list[dict] = []
     call_count = 0
@@ -353,6 +355,9 @@ def run_turn(config: AssistantConfig, contractors: list[Contractor], text: str,
         if searches:
             allowed = {r["id"] for result in searches for r in result["recommendations"]}
             if any(c.id not in allowed and c.name.casefold() in answer.casefold() for c in contractors):
+                answer = fallback
+            if any(r["matched_count"] == 0 for r in searches):
+                # Empty results must explain the lack of matches and ask a grounded next question.
                 answer = fallback
         elif not viewing:
             asked = question_fields(answer)

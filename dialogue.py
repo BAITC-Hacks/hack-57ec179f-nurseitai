@@ -16,7 +16,7 @@ MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля
 
 
 def empty_state():
-    return dict(original_need="", required_services=[], conditions={}, last_results=[],
+    return dict(original_need="", current_need="", required_services=[], conditions={}, last_results=[],
                 selected_contractor=None, viewed_profile=None, pending_fields=[], service_mode="combined",
                 awaiting_service_mode=False, awaiting_separate=False)
 
@@ -27,6 +27,8 @@ def normalize(text):
 
 def resolve_services(text, categories):
     value = normalize(text)
+    # Explicit exclusions cannot become requested services through keyword matching.
+    value = re.sub(r"\bне\s+(?:фото\s*буд\w*|фото\s*зеркал\w*|видео\s*буд\w*|фотограф\w*|видеограф\w*)", "", value)
     if re.search(r"фото\s*буд|фото\s*зеркал|видео\s*буд", value):
         requested = ["Фото и видеобудки"]
     else:
@@ -116,6 +118,7 @@ def extract_conditions(text, options, today, pending=()):
 
 def prepare_turn(previous, text, options, today, contractors):
     state = deepcopy(previous or empty_state())
+    state.setdefault("current_need", state["original_need"])
     value = normalize(text)
     if re.search(r"выбираю|выбрал|остановимся", value):
         candidates = [c for r in state["last_results"] for c in r["recommendations"]
@@ -136,7 +139,10 @@ def prepare_turn(previous, text, options, today, contractors):
     if (state["awaiting_separate"] and re.fullmatch(r"\s*(да|давай|давайте|согласен)[.!]?\s*", value)) or separate:
         state.update(service_mode="separate", awaiting_separate=False, awaiting_service_mode=False)
     if resolved:
-        state["original_need"] = text if not state["original_need"] or state["required_services"] != resolved else state["original_need"]
+        if not state["original_need"]:
+            state["original_need"] = text
+        if state["required_services"] != resolved:
+            state["current_need"] = text
         if state["required_services"] != resolved:
             state.update(service_mode="separate" if separate else "combined", selected_contractor=None,
                          awaiting_separate=False, awaiting_service_mode=False)
@@ -145,8 +151,10 @@ def prepare_turn(previous, text, options, today, contractors):
             state["awaiting_service_mode"] = True
     elif re.search(r"\bтестиров\w*|^другое[.!]?$", value) or (
             re.search(r"нуж\w*|ищу|человек|специалист", value) and
-            (not state["required_services"] or not extract_conditions(text, options, today))):
-        state.update(original_need=text, required_services=[], last_results=[], selected_contractor=None,
+            (not state["required_services"] or not extract_conditions(text, options, today) or
+             (re.search(r"нужен|нужна|ищу|специалист|человек", value) and not re.search(r"бюджет|язык|дат|город|час|длительност", value)))):
+        state.update(original_need=state["original_need"] or text, current_need=text,
+                     required_services=[], last_results=[], selected_contractor=None,
                      awaiting_service_mode=False, awaiting_separate=False, service_mode="combined")
         return state, "Такую услугу пока не удалось сопоставить с каталогом. Какую задачу должен выполнять специалист?", False
     if before != (state["required_services"], state["conditions"]):
@@ -157,7 +165,9 @@ def prepare_turn(previous, text, options, today, contractors):
     if len(state["required_services"]) > 1 and state["service_mode"] == "combined" and not any(
             set(state["required_services"]) <= set(c.categories) for c in contractors):
         state["awaiting_separate"] = True
-        return state, "В каталоге нет подрядчика, у которого заявлены обе услуги. Рассмотреть отдельно фотографа и видеографа?", False
+        services = ", ".join(state["required_services"])
+        label = "отдельно фотографа и видеографа" if set(state["required_services"]) == {"Фотограф", "Видеограф"} else f"отдельных исполнителей для услуг: {services}"
+        return state, f"В каталоге нет подрядчика, у которого заявлены все услуги: {services}. Рассмотреть {label}?", False
     state["pending_fields"] = [f for f in FIELDS if f not in state["conditions"]]
     return state, "", False
 
@@ -188,6 +198,8 @@ def search_arguments(state, category=None):
 def state_from_request(request, previous=None):
     state = deepcopy(previous or empty_state())
     state["required_services"] = list(request.get("required_categories") or [request["category"]])
+    state["current_need"] = ", ".join(state["required_services"])
+    state["original_need"] = state["original_need"] or state["current_need"]
     state["conditions"] = {k: request[k] for k in (*FIELDS, "preferences")}
     state.update(pending_fields=[], awaiting_service_mode=False, awaiting_separate=False,
                  service_mode="combined", selected_contractor=None)
@@ -209,7 +221,7 @@ def fallback_text(outputs, state):
     results = [o["result"] for o in outputs if o["name"] == "search_contractors" and "error" not in o["result"]]
     if results:
         return "\n\n".join(" + ".join(r["request"].get("required_categories") or [r["request"]["category"]]) +
-                            ": " + r["message"] for r in results)
+                            ": " + r["message"] + ("\n" + r["clarification"] if r.get("clarification") else "") for r in results)
     profiles = [o["result"] for o in outputs if o["name"] in ("get_contractor", "explain_contractor_match") and "error" not in o["result"]]
     if profiles:
         p = profiles[-1]
