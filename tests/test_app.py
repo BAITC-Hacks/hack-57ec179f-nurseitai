@@ -67,7 +67,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(app.session_state["active_result"]["matched_count"], 2)
         self.assertTrue(any("пожелание не подтверждено" in info.value for info in app.info))
 
-    def test_comparison_shortlist_demo_request_and_history(self):
+    def test_comparison_shortlist_and_history(self):
         app = self.app().run()
         app.button(key="manual_submit").click().run()
         payload = app.session_state["active_result"]
@@ -79,11 +79,6 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(app.dataframe[0].value), 3)
         app.button(key=f"save_{key}_{first['id']}").click().run()
         self.assertIn(first["id"], app.session_state["shortlist"])
-        for _ in range(2):
-            app.button(key=f"request_{key}_{first['id']}").click().run()
-        self.assertFalse(app.exception)
-        self.assertEqual(len(app.session_state["demo_requests"]), 1)
-        self.assertTrue(any("Ничего не отправлено" in item.value for item in app.success))
         self.assertEqual(len(app.session_state["search_history"]), 1)
         app.button(key="history_0").click().run()
         self.assertFalse(app.exception)

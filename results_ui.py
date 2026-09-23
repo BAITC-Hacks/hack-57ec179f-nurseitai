@@ -3,7 +3,7 @@ import re
 import streamlit as st
 
 from assistant_ui import describe_request
-from product import comparison_rows, create_demo_request, detailed_reasons, search_id, toggle_shortlist
+from product import comparison_rows, detailed_reasons, search_id, toggle_shortlist
 
 
 def render_profile_feature(value):
@@ -53,10 +53,6 @@ def render_result(payload, on_request, debug=False):
             saved = rec["id"] in st.session_state.get("shortlist", {})
             st.button("Убрать из shortlist" if saved else "♡ В shortlist", key=f"save_{key}_{rec['id']}",
                       on_click=toggle_shortlist, args=(st.session_state, rec, request))
-            if st.button("Создать демо-заявку", key=f"request_{key}_{rec['id']}"):
-                demo = create_demo_request(st.session_state, rec, request)
-                st.session_state.demo_notice = f"{demo['id']}: черновик создан. Ничего не отправлено."
-                st.rerun()
             with st.expander("Связаться"):
                 st.caption("В анонимизированном каталоге нет контактов. Можно подготовить текст обращения.")
                 st.code(f"Здравствуйте! Нужен {request['category'].lower()} на {request['event_format']} "
