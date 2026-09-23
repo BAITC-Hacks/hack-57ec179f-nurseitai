@@ -4,6 +4,7 @@ from pathlib import Path
 import streamlit as st
 
 from recommender import CALENDAR_END, SearchRequest, load_contractors, recommend
+from assistant_ui import render_assistant
 
 
 DATA_PATH = Path(__file__).parent / "data" / "contractors.csv"
@@ -40,6 +41,10 @@ formats = sorted({value for item in contractors for value in item.event_formats}
 languages = sorted({value for item in contractors for value in item.languages})
 st.session_state.setdefault("event_date", date(2026, 10, 14))
 st.session_state.setdefault("budget", 1_500_000)
+st.session_state.setdefault("category", "Ведущий")
+st.session_state.setdefault("event_format", "свадьба")
+st.session_state.setdefault("language", "русский")
+st.session_state.setdefault("duration", 6)
 
 
 def apply_suggestion(request):
@@ -62,17 +67,16 @@ with st.form("search"):
             max_value=CALENDAR_END,
             key="event_date",
         )
-        category = st.selectbox("Категория", categories, index=categories.index("Ведущий"), key="category")
+        category = st.selectbox("Категория", categories, key="category")
     with middle:
-        event_format = st.selectbox("Формат мероприятия", formats, index=formats.index("свадьба"), key="event_format")
+        event_format = st.selectbox("Формат мероприятия", formats, key="event_format")
         budget = st.number_input("Бюджет, ₸", min_value=100_000, step=50_000, key="budget")
         language_options = ["Неважно", *languages]
-        language = st.selectbox("Язык", language_options, index=language_options.index("русский"), key="language")
+        language = st.selectbox("Язык", language_options, key="language")
     with right:
         duration = st.selectbox(
             "Длительность",
             ["Неважно", *range(1, 13)],
-            index=6,
             key="duration",
             format_func=lambda value: value if value == "Неважно" else f"{value} ч",
         )
@@ -135,3 +139,5 @@ if "search_request" in st.session_state:
         with st.expander("Почему другие кандидаты не прошли"):
             for reason, count in result.rejection_counts:
                 st.write(f"- {reason}: {count}")
+
+render_assistant(contractors, apply_suggestion)
